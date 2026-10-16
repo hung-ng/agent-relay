@@ -1,0 +1,18 @@
+data/
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
+node_modules/
+# Local maintainer files
+/AGENTS.md
+/CLAUDE.md
+/STATUS.md
+/TODO.md
+/PROGRESS.md
+/PLAN.md
+/.private/
+/.agents/
+/.claude/
+/.codex/
+/docs/*

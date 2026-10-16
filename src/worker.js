@@ -1,0 +1,186 @@
+import { spawn } from "node:child_process";
+import { runProbe } from "./probes.js";
+
+export class Worker {
+  constructor({ serverUrl, agentId, hostId, kind = "probe", capabilities = ["network.probe"], token = "", command = null, cwd = process.cwd(), logger = console }) {
+    this.serverUrl = serverUrl.replace(/\/$/, "");
+    this.agentId = agentId;
+    this.hostId = hostId;
+    this.kind = kind;
+    this.capabilities = capabilities;
+    this.token = token;
+    this.command = command;
+    this.cwd = cwd;
+    this.logger = logger;
+    this.stopped = false;
+    this.abortController = new AbortController();
+  }
+
+  async start() {
+    await this.register();
+    this.heartbeatTimer = setInterval(() => this.heartbeat().catch((error) => this.logger.error(error)), 15000);
+    this.connectEvents();
+  }
+
+  async stop() {
+    this.stopped = true;
+    clearInterval(this.heartbeatTimer);
+    this.abortController.abort();
+  }
+
+  async register() {
+    await this.request("/v1/agents/register", {
+      method: "POST",
+      body: {
+        id: this.agentId,
+        host_id: this.hostId,
+        kind: this.kind,
+        capabilities: this.capabilities
+      }
+    });
+  }
+
+  async heartbeat() {
+    await this.request(`/v1/agents/${encodeURIComponent(this.agentId)}/heartbeat`, { method: "POST" });
+  }
+
+  async connectEvents() {
+    while (!this.stopped) {
+      try {
+        const response = await fetch(`${this.serverUrl}/v1/events?agent_id=${encodeURIComponent(this.agentId)}`, {
+          headers: this.headers(),
+          signal: this.abortController.signal
+        });
+        if (!response.ok || !response.body) throw new Error(`event stream failed: ${response.status}`);
+        await this.consumeEvents(response.body);
+      } catch (error) {
+        if (!this.stopped) {
+          this.logger.error(`agent-relay connection lost: ${error.message}`);
+          await delay(1000);
+        }
+      }
+    }
+  }
+
+  async consumeEvents(body) {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (!this.stopped) {
+      const { value, done } = await reader.read();
+      if (done) return;
+      buffer += decoder.decode(value, { stream: true });
+      let boundary;
+      while ((boundary = buffer.indexOf("\n\n")) >= 0) {
+        const raw = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        const event = parseEvent(raw);
+        if (event?.event === "job.created") await this.handleJob(event.data);
+        if (event?.event === "message.created") await this.handleMessage(event.data);
+      }
+    }
+  }
+
+  async handleMessage(message) {
+    await this.request(`/v1/messages/${encodeURIComponent(message.id)}/deliver`, { method: "POST" });
+    const body = message.payload?.body ?? JSON.stringify(message.payload);
+    this.logger.log(`[${this.agentId}] message from ${message.sender}: ${body}`);
+    if ((this.kind === "claude" || this.kind === "codex") && ["message", "request", "task"].includes(message.type)) {
+      try {
+        const result = await this.runAgentTask({ prompt: body });
+        await this.request("/v1/messages", {
+          method: "POST",
+          body: {
+            sender: this.agentId,
+            recipient: message.sender,
+            type: "reply",
+            conversation_id: message.conversation_id,
+            payload: { body: result.stdout || "", result }
+          }
+        });
+      } catch (error) {
+        await this.request("/v1/messages", {
+          method: "POST",
+          body: {
+            sender: this.agentId,
+            recipient: message.sender,
+            type: "reply",
+            conversation_id: message.conversation_id,
+            payload: { body: `Agent failed: ${error.message}`, error: error.message }
+          }
+        });
+      }
+    }
+    await this.request(`/v1/messages/${encodeURIComponent(message.id)}/ack`, { method: "POST" });
+  }
+
+  async handleJob(job) {
+    const claimed = await this.request(`/v1/jobs/${encodeURIComponent(job.id)}/claim`, {
+      method: "POST",
+      body: { agent_id: this.agentId }
+    });
+    if (!claimed.job) return;
+    try {
+      let result;
+      if (job.kind === "network.probe") result = await runProbe(job.payload);
+      else if (job.kind === "agent.task") result = await this.runAgentTask(job.payload);
+      else throw new Error(`unsupported job kind: ${job.kind}`);
+      await this.request(`/v1/jobs/${encodeURIComponent(job.id)}/complete`, { method: "POST", body: { result } });
+    } catch (error) {
+      await this.request(`/v1/jobs/${encodeURIComponent(job.id)}/fail`, { method: "POST", body: { error: error.message } });
+    }
+  }
+
+  async runAgentTask(payload) {
+    const prompt = String(payload?.prompt ?? "");
+    if (!prompt) throw new Error("agent.task requires payload.prompt");
+    const command = this.command ?? this.kind;
+    const args = command === "claude" ? ["-p", prompt, "--output-format", "json"] : ["exec", prompt];
+    return runProcess(command, args, { cwd: payload.cwd ?? this.cwd });
+  }
+
+  async request(path, { method = "GET", body } = {}) {
+    const response = await fetch(`${this.serverUrl}${path}`, {
+      method,
+      headers: { ...this.headers(), ...(body ? { "content-type": "application/json" } : {}) },
+      body: body ? JSON.stringify(body) : undefined
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error ?? `request failed: ${response.status}`);
+    return data;
+  }
+
+  headers() {
+    return this.token ? { authorization: `Bearer ${this.token}` } : {};
+  }
+}
+
+function parseEvent(raw) {
+  let event = "message";
+  let data = "";
+  for (const line of raw.split("\n")) {
+    if (line.startsWith("event:")) event = line.slice(6).trim();
+    if (line.startsWith("data:")) data += line.slice(5).trim();
+  }
+  if (!data) return null;
+  return { event, data: JSON.parse(data) };
+}
+
+function runProcess(command, args, options) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { ...options, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", reject);
+    child.on("close", (code, signal) => {
+      if (code === 0) resolve({ command, args, code, signal, stdout: stdout.slice(0, 128_000), stderr: stderr.slice(0, 128_000) });
+      else reject(new Error(`${command} exited with code ${code ?? "unknown"}${signal ? ` (${signal})` : ""}: ${stderr || stdout}`));
+    });
+  });
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}

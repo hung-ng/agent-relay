@@ -1,0 +1,17 @@
+{
+  "name": "agent-relay",
+  "version": "0.1.0",
+  "description": "A small coordinator for local coding agents and host-side jobs",
+  "type": "module",
+  "bin": {
+    "agent-relay": "src/cli.js"
+  },
+  "scripts": {
+    "start": "node src/cli.js server",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22.5"
+  },
+  "license": "MIT"
+}
