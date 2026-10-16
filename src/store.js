@@ -36,6 +36,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS jobs (
         id TEXT PRIMARY KEY,
         kind TEXT NOT NULL,
+        required_capability TEXT,
         requested_by TEXT NOT NULL,
         target_agent TEXT,
         source_host TEXT,
@@ -57,10 +58,19 @@ export class Store {
       CREATE INDEX IF NOT EXISTS agents_host
         ON agents(host_id, status);
     `);
+    const jobColumns = this.db.prepare("PRAGMA table_info(jobs)").all();
+    if (!jobColumns.some((column) => column.name === "required_capability")) {
+      this.db.exec("ALTER TABLE jobs ADD COLUMN required_capability TEXT");
+    }
   }
 
   close() {
     this.db.close();
+  }
+
+  checkReady() {
+    this.db.prepare("SELECT 1").get();
+    return true;
   }
 
   registerAgent({ id, hostId, kind = "unknown", capabilities = [], metadata = {} }) {
@@ -109,6 +119,12 @@ export class Store {
     return match ? this.#agent(match) : null;
   }
 
+  agentSupports(agentId, capability) {
+    this.markStale();
+    const agent = this.getAgent(agentId);
+    return Boolean(agent && agent.status === "online" && (!capability || agent.capabilities.includes(capability)));
+  }
+
   markStale(maxAgeMs = 45_000) {
     const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
     return this.db.prepare(
@@ -152,30 +168,62 @@ export class Store {
     return rows.map((row) => this.#message(row));
   }
 
+  getPendingWork(agentId, limit = 50) {
+    const boundedLimit = Math.min(Math.max(Number(limit) || 50, 1), 200);
+    const messages = this.db.prepare(`
+      SELECT * FROM messages
+      WHERE recipient = ? AND status IN ('queued', 'delivered')
+      ORDER BY created_at ASC
+      LIMIT ?
+    `).all(agentId, boundedLimit).map((row) => this.#message(row));
+    const jobs = this.db.prepare(`
+      SELECT * FROM jobs
+      WHERE target_agent = ? AND status IN ('queued', 'running')
+      ORDER BY created_at ASC
+      LIMIT ?
+    `).all(agentId, boundedLimit).map((row) => this.#job(row));
+    return { messages, jobs };
+  }
+
   markMessageDelivered(id) {
-    const timestamp = now();
-    this.db.prepare(
-      "UPDATE messages SET status = 'delivered', delivered_at = ? WHERE id = ?"
-    ).run(timestamp, id);
-    return this.getMessage(id);
+    return this.#transitionMessage(id, null, "delivered");
+  }
+
+  markMessageDeliveredBy(id, agentId) {
+    return this.#transitionMessage(id, agentId, "delivered");
   }
 
   acknowledgeMessage(id) {
-    const timestamp = now();
-    this.db.prepare(
-      "UPDATE messages SET status = 'acknowledged', acknowledged_at = ? WHERE id = ?"
-    ).run(timestamp, id);
+    return this.#transitionMessage(id, null, "acknowledged");
+  }
+
+  acknowledgeMessageBy(id, agentId) {
+    return this.#transitionMessage(id, agentId, "acknowledged");
+  }
+
+  #transitionMessage(id, agentId, status) {
+    const message = this.getMessage(id);
+    if (!message || (agentId && message.recipient !== agentId)) return null;
+    if (status === "delivered" && ["queued", "delivered"].includes(message.status)) {
+      this.db.prepare(
+        "UPDATE messages SET status = 'delivered', delivered_at = ? WHERE id = ? AND status IN ('queued', 'delivered')"
+      ).run(now(), id);
+    } else if (status === "acknowledged" && ["queued", "delivered"].includes(message.status)) {
+      this.db.prepare(
+        "UPDATE messages SET status = 'acknowledged', acknowledged_at = ? WHERE id = ? AND status IN ('queued', 'delivered')"
+      ).run(now(), id);
+    }
     return this.getMessage(id);
   }
 
-  createJob({ id, kind, requestedBy, targetAgent = null, sourceHost = null, targetHost = null, payload = {} }) {
+  createJob({ id, kind, requiredCapability = null, requestedBy, targetAgent = null, sourceHost = null, targetHost = null, payload = {} }) {
     const jobId = id ?? randomUUID();
     const timestamp = now();
     this.db.prepare(`
       INSERT INTO jobs
-        (id, kind, requested_by, target_agent, source_host, target_host, payload, status, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)
-    `).run(jobId, kind, requestedBy, targetAgent, sourceHost, targetHost, JSON.stringify(payload), timestamp);
+        (id, kind, required_capability, requested_by, target_agent, source_host, target_host, payload, status, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)
+    `).run(jobId, kind, requiredCapability, requestedBy, targetAgent, sourceHost, targetHost, JSON.stringify(payload), timestamp);
     return this.getJob(jobId);
   }
 
@@ -191,24 +239,42 @@ export class Store {
       SET status = 'running', claimed_by = ?, started_at = ?
       WHERE id = ? AND status = 'queued' AND (target_agent IS NULL OR target_agent = ?)
     `).run(agentId, timestamp, id, agentId);
-    return result.changes > 0 ? this.getJob(id) : null;
+    if (result.changes > 0) return this.getJob(id);
+    const existing = this.getJob(id);
+    return existing?.status === 'running' && existing.claimed_by === agentId ? existing : null;
   }
 
   completeJob(id, result) {
-    const timestamp = now();
-    this.db.prepare(`
-      UPDATE jobs SET status = 'completed', result = ?, completed_at = ?
-      WHERE id = ? AND status = 'running'
-    `).run(JSON.stringify(result ?? {}), timestamp, id);
-    return this.getJob(id);
+    return this.#finishJob(id, "completed", { result });
+  }
+
+  completeJobBy(id, result, agentId) {
+    return this.#finishJob(id, "completed", { result }, agentId);
   }
 
   failJob(id, error) {
+    return this.#finishJob(id, "failed", { error });
+  }
+
+  failJobBy(id, error, agentId) {
+    return this.#finishJob(id, "failed", { error }, agentId);
+  }
+
+  #finishJob(id, status, values, agentId = null) {
+    const existing = this.getJob(id);
+    if (!existing || (agentId && existing.claimed_by !== agentId)) return null;
     const timestamp = now();
-    this.db.prepare(`
-      UPDATE jobs SET status = 'failed', error = ?, completed_at = ?
-      WHERE id IN (SELECT id FROM jobs WHERE id = ? AND status IN ('queued', 'running'))
-    `).run(String(error), timestamp, id);
+    if (status === "completed") {
+      this.db.prepare(`
+        UPDATE jobs SET status = 'completed', result = ?, completed_at = ?
+        WHERE id = ? AND status = 'running'
+      `).run(JSON.stringify(values.result ?? {}), timestamp, id);
+    } else {
+      this.db.prepare(`
+        UPDATE jobs SET status = 'failed', error = ?, completed_at = ?
+        WHERE id = ? AND status IN ('queued', 'running')
+      `).run(String(values.error), timestamp, id);
+    }
     return this.getJob(id);
   }
 
@@ -253,6 +319,7 @@ export class Store {
     return {
       id: row.id,
       kind: row.kind,
+      required_capability: row.required_capability,
       requested_by: row.requested_by,
       target_agent: row.target_agent,
       source_host: row.source_host,

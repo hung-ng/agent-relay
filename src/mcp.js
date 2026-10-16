@@ -84,6 +84,7 @@ export function mcpTools() {
         properties: {
           requested_by: { type: "string" },
           kind: { type: "string" },
+          capability: { type: "string" },
           target_agent: { type: "string" },
           source_host: { type: "string" },
           target_host: { type: "string" },
@@ -212,10 +213,13 @@ async function callTool(name, args, { store, publish }) {
       if (!value) throw new Error(`message not found: ${args.message_id}`);
       break;
     case "dispatch_job": {
-      const targetAgent = args.target_agent ?? (args.source_host ? store.findAgentForHost(args.source_host)?.id : null);
+      const requiredCapability = args.capability ?? args.kind;
+      const targetAgent = args.target_agent ?? (args.source_host ? store.findAgentForHost(args.source_host, requiredCapability)?.id : null);
       if (!targetAgent) throw new Error("no target agent is registered for this job");
+      if (!store.agentSupports(targetAgent, requiredCapability)) throw new Error("target agent does not provide the required capability");
       const job = store.createJob({
         kind: args.kind,
+        requiredCapability,
         requestedBy: args.requested_by,
         targetAgent,
         sourceHost: args.source_host ?? null,
@@ -231,6 +235,7 @@ async function callTool(name, args, { store, publish }) {
       if (!targetAgent) throw new Error(`no network probe worker is registered for ${args.source_host}`);
       const job = store.createJob({
         kind: "network.probe",
+        requiredCapability: "network.probe",
         requestedBy: args.requested_by,
         targetAgent,
         sourceHost: args.source_host,

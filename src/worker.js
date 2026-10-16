@@ -14,6 +14,9 @@ export class Worker {
     this.logger = logger;
     this.stopped = false;
     this.abortController = new AbortController();
+    this.activeMessages = new Set();
+    this.activeJobs = new Set();
+    this.reconnectDelayMs = 1000;
   }
 
   async start() {
@@ -46,17 +49,28 @@ export class Worker {
 
   async connectEvents() {
     while (!this.stopped) {
+      let response;
       try {
-        const response = await fetch(`${this.serverUrl}/v1/events?agent_id=${encodeURIComponent(this.agentId)}`, {
+        response = await fetch(`${this.serverUrl}/v1/events?agent_id=${encodeURIComponent(this.agentId)}`, {
           headers: this.headers(),
           signal: this.abortController.signal
         });
         if (!response.ok || !response.body) throw new Error(`event stream failed: ${response.status}`);
+        this.reconnectDelayMs = 1000;
+        await this.replayPending();
         await this.consumeEvents(response.body);
+        if (!this.stopped) throw new Error("event stream closed");
       } catch (error) {
         if (!this.stopped) {
           this.logger.error(`agent-relay connection lost: ${error.message}`);
-          await delay(1000);
+          await delay(this.reconnectDelayMs);
+          this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, 30_000);
+        }
+      } finally {
+        try {
+          await response?.body?.cancel?.();
+        } catch {
+          // The connection is already closed.
         }
       }
     }
@@ -81,53 +95,78 @@ export class Worker {
     }
   }
 
+  async replayPending() {
+    const pending = await this.request(`/v1/pending?agent_id=${encodeURIComponent(this.agentId)}`);
+    for (const message of pending.messages ?? []) await this.handleMessage(message);
+    for (const job of pending.jobs ?? []) await this.handleJob(job);
+  }
+
   async handleMessage(message) {
-    await this.request(`/v1/messages/${encodeURIComponent(message.id)}/deliver`, { method: "POST" });
-    const body = message.payload?.body ?? JSON.stringify(message.payload);
-    this.logger.log(`[${this.agentId}] message from ${message.sender}: ${body}`);
-    if ((this.kind === "claude" || this.kind === "codex") && ["message", "request", "task"].includes(message.type)) {
-      try {
-        const result = await this.runAgentTask({ prompt: body });
-        await this.request("/v1/messages", {
-          method: "POST",
-          body: {
-            sender: this.agentId,
-            recipient: message.sender,
-            type: "reply",
-            conversation_id: message.conversation_id,
-            payload: { body: result.stdout || "", result }
-          }
-        });
-      } catch (error) {
-        await this.request("/v1/messages", {
-          method: "POST",
-          body: {
-            sender: this.agentId,
-            recipient: message.sender,
-            type: "reply",
-            conversation_id: message.conversation_id,
-            payload: { body: `Agent failed: ${error.message}`, error: error.message }
-          }
-        });
+    if (this.activeMessages.has(message.id)) return;
+    this.activeMessages.add(message.id);
+    try {
+      const delivery = await this.request(`/v1/messages/${encodeURIComponent(message.id)}/deliver`, { method: "POST" });
+      if (delivery.message?.status === "acknowledged") return;
+      const body = message.payload?.body ?? JSON.stringify(message.payload);
+      this.logger.log(`[${this.agentId}] message from ${message.sender}: ${body}`);
+      if ((this.kind === "claude" || this.kind === "codex") && ["message", "request", "task"].includes(message.type)) {
+        try {
+          const result = await this.runAgentTask({ prompt: body });
+          await this.request("/v1/messages", {
+            method: "POST",
+            body: {
+              sender: this.agentId,
+              recipient: message.sender,
+              type: "reply",
+              conversation_id: message.conversation_id,
+              payload: { body: result.stdout || "", result }
+            }
+          });
+        } catch (error) {
+          await this.request("/v1/messages", {
+            method: "POST",
+            body: {
+              sender: this.agentId,
+              recipient: message.sender,
+              type: "reply",
+              conversation_id: message.conversation_id,
+              payload: { body: `Agent failed: ${error.message}`, error: error.message }
+            }
+          });
+        }
       }
+      await this.request(`/v1/messages/${encodeURIComponent(message.id)}/ack`, { method: "POST" });
+    } finally {
+      this.activeMessages.delete(message.id);
     }
-    await this.request(`/v1/messages/${encodeURIComponent(message.id)}/ack`, { method: "POST" });
   }
 
   async handleJob(job) {
-    const claimed = await this.request(`/v1/jobs/${encodeURIComponent(job.id)}/claim`, {
-      method: "POST",
-      body: { agent_id: this.agentId }
-    });
-    if (!claimed.job) return;
+    if (this.activeJobs.has(job.id)) return;
+    this.activeJobs.add(job.id);
     try {
-      let result;
-      if (job.kind === "network.probe") result = await runProbe(job.payload);
-      else if (job.kind === "agent.task") result = await this.runAgentTask(job.payload);
-      else throw new Error(`unsupported job kind: ${job.kind}`);
-      await this.request(`/v1/jobs/${encodeURIComponent(job.id)}/complete`, { method: "POST", body: { result } });
-    } catch (error) {
-      await this.request(`/v1/jobs/${encodeURIComponent(job.id)}/fail`, { method: "POST", body: { error: error.message } });
+      let claimed;
+      try {
+        claimed = await this.request(`/v1/jobs/${encodeURIComponent(job.id)}/claim`, {
+          method: "POST",
+          body: { agent_id: this.agentId }
+        });
+      } catch (error) {
+        if (error.status === 409) return;
+        throw error;
+      }
+      if (!claimed.job) return;
+      try {
+        let result;
+        if (job.kind === "network.probe") result = await runProbe(job.payload);
+        else if (job.kind === "agent.task") result = await this.runAgentTask(job.payload);
+        else throw new Error(`unsupported job kind: ${job.kind}`);
+        await this.request(`/v1/jobs/${encodeURIComponent(job.id)}/complete`, { method: "POST", body: { result } });
+      } catch (error) {
+        await this.request(`/v1/jobs/${encodeURIComponent(job.id)}/fail`, { method: "POST", body: { error: error.message } });
+      }
+    } finally {
+      this.activeJobs.delete(job.id);
     }
   }
 
@@ -146,12 +185,19 @@ export class Worker {
       body: body ? JSON.stringify(body) : undefined
     });
     const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.error ?? `request failed: ${response.status}`);
+    if (!response.ok) {
+      const error = new Error(data.error ?? `request failed: ${response.status}`);
+      error.status = response.status;
+      throw error;
+    }
     return data;
   }
 
   headers() {
-    return this.token ? { authorization: `Bearer ${this.token}` } : {};
+    return {
+      ...(this.token ? { authorization: `Bearer ${this.token}` } : {}),
+      "x-agent-id": this.agentId
+    };
   }
 }
 

@@ -35,3 +35,31 @@ test("agent workers turn requests into replies", async () => {
   assert.equal(calls[1].options.body.type, "reply");
   assert.equal(calls[1].options.body.payload.body, "answer: check the service");
 });
+
+test("agent workers skip a duplicate message after it is acknowledged", async () => {
+  const calls = [];
+  const worker = new Worker({
+    serverUrl: "http://bus",
+    agentId: "claude@book",
+    hostId: "book",
+    kind: "claude",
+    logger: { log() {}, error() {} }
+  });
+  worker.request = async (path) => {
+    calls.push(path);
+    return { message: { status: "acknowledged" } };
+  };
+  worker.runAgentTask = async () => {
+    throw new Error("duplicate task execution");
+  };
+
+  await worker.handleMessage({
+    id: "message-2",
+    sender: "codex@mini",
+    recipient: "claude@book",
+    type: "request",
+    payload: { body: "run once" }
+  });
+
+  assert.deepEqual(calls, ["/v1/messages/message-2/deliver"]);
+});

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agent-relay.server</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@@NODE_BIN@@</string>
+    <string>@@AGENT_RELAY_ROOT@@/src/cli.js</string>
+    <string>server</string>
+    <string>--host</string>
+    <string>@@AGENT_RELAY_HOST@@</string>
+    <string>--port</string>
+    <string>@@AGENT_RELAY_PORT@@</string>
+    <string>--db</string>
+    <string>@@AGENT_RELAY_DATA@@/agent-relay.db</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>@@AGENT_RELAY_ROOT@@</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AGENT_RELAY_TOKEN</key>
+    <string>@@AGENT_RELAY_TOKEN@@</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>@@AGENT_RELAY_LOG_DIR@@/server.log</string>
+  <key>StandardErrorPath</key>
+  <string>@@AGENT_RELAY_LOG_DIR@@/server.error.log</string>
+</dict>
+</plist>

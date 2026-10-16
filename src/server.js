@@ -27,9 +27,17 @@ export function createServer({ dbPath = "./data/agent-relay.db", token = process
       if (url.pathname === "/healthz" && request.method === "GET") {
         return sendJson(response, 200, { ok: true, service: "agent-relay" });
       }
+      if (url.pathname === "/readyz" && request.method === "GET") {
+        store.checkReady();
+        return sendJson(response, 200, { ok: true, service: "agent-relay" });
+      }
       if (url.pathname === "/mcp" && request.method === "POST") return mcpHandler(request, response);
       if (url.pathname === "/v1/events" && request.method === "GET") {
-        return openEvents(url.searchParams.get("agent_id"), request, response);
+        const agentId = url.searchParams.get("agent_id");
+        const actor = agentIdentity(request);
+        if (!actor) return sendJson(response, 401, { error: "x-agent-id is required" });
+        if (actor !== agentId) return sendJson(response, 403, { error: "agent identity does not match agent_id" });
+        return openEvents(agentId, request, response);
       }
       if (url.pathname === "/v1/agents" && request.method === "GET") {
         return sendJson(response, 200, { agents: store.listAgents() });
@@ -47,7 +55,11 @@ export function createServer({ dbPath = "./data/agent-relay.db", token = process
       }
       const heartbeat = url.pathname.match(/^\/v1\/agents\/([^/]+)\/heartbeat$/);
       if (heartbeat && request.method === "POST") {
-        const agent = store.heartbeat(decodeURIComponent(heartbeat[1]));
+        const actor = agentIdentity(request);
+        if (!actor) return sendJson(response, 401, { error: "x-agent-id is required" });
+        const agentId = decodeURIComponent(heartbeat[1]);
+        if (actor !== agentId) return sendJson(response, 403, { error: "agent identity does not match agent_id" });
+        const agent = store.heartbeat(agentId);
         return agent ? sendJson(response, 200, { agent }) : sendJson(response, 404, { error: "agent not found" });
       }
       if (url.pathname === "/v1/messages" && request.method === "POST") {
@@ -68,19 +80,38 @@ export function createServer({ dbPath = "./data/agent-relay.db", token = process
         if (!recipient) return sendJson(response, 400, { error: "agent_id is required" });
         return sendJson(response, 200, { messages: store.getMessages(recipient, url.searchParams.get("limit")) });
       }
+      if (url.pathname === "/v1/pending" && request.method === "GET") {
+        const agentId = url.searchParams.get("agent_id");
+        if (!agentId) return sendJson(response, 400, { error: "agent_id is required" });
+        const actor = agentIdentity(request);
+        if (!actor) return sendJson(response, 401, { error: "x-agent-id is required" });
+        if (actor !== agentId) return sendJson(response, 403, { error: "agent identity does not match agent_id" });
+        return sendJson(response, 200, store.getPendingWork(agentId, url.searchParams.get("limit")));
+      }
       const messageAction = url.pathname.match(/^\/v1\/messages\/([^/]+)\/(ack|deliver)$/);
       if (messageAction && request.method === "POST") {
+        const actor = agentIdentity(request);
+        if (!actor) return sendJson(response, 401, { error: "x-agent-id is required" });
         const id = decodeURIComponent(messageAction[1]);
-        const message = messageAction[2] === "ack" ? store.acknowledgeMessage(id) : store.markMessageDelivered(id);
-        return message ? sendJson(response, 200, { message }) : sendJson(response, 404, { error: "message not found" });
+        const message = messageAction[2] === "ack"
+          ? store.acknowledgeMessageBy(id, actor)
+          : store.markMessageDeliveredBy(id, actor);
+        return message
+          ? sendJson(response, 200, { message })
+          : sendJson(response, 403, { error: "agent is not the message recipient" });
       }
       if (url.pathname === "/v1/jobs" && request.method === "POST") {
         const body = await readJson(request);
         if (!body.kind || !body.requested_by) return sendJson(response, 400, { error: "kind and requested_by are required" });
-        const targetAgent = body.target_agent ?? (body.source_host ? store.findAgentForHost(body.source_host)?.id : null);
+        const requiredCapability = body.capability ?? body.kind;
+        const targetAgent = body.target_agent ?? (body.source_host ? store.findAgentForHost(body.source_host, requiredCapability)?.id : null);
         if (!targetAgent) return sendJson(response, 409, { error: "no target agent is registered" });
+        if (!store.agentSupports(targetAgent, requiredCapability)) {
+          return sendJson(response, 409, { error: "target agent does not provide the required capability" });
+        }
         const job = store.createJob({
           kind: body.kind,
+          requiredCapability,
           requestedBy: body.requested_by,
           targetAgent,
           sourceHost: body.source_host,
@@ -97,21 +128,37 @@ export function createServer({ dbPath = "./data/agent-relay.db", token = process
       }
       const jobClaim = url.pathname.match(/^\/v1\/jobs\/([^/]+)\/claim$/);
       if (jobClaim && request.method === "POST") {
+        const actor = agentIdentity(request);
+        if (!actor) return sendJson(response, 401, { error: "x-agent-id is required" });
         const body = await readJson(request);
-        const job = store.claimJob(decodeURIComponent(jobClaim[1]), body.agent_id);
+        if (body.agent_id !== actor) return sendJson(response, 403, { error: "agent identity does not match agent_id" });
+        const id = decodeURIComponent(jobClaim[1]);
+        const existing = store.getJob(id);
+        if (!existing) return sendJson(response, 404, { error: "job not found" });
+        if (existing.target_agent && existing.target_agent !== actor) {
+          return sendJson(response, 403, { error: "agent is not the job target" });
+        }
+        const job = store.claimJob(id, actor);
         return job ? sendJson(response, 200, { job }) : sendJson(response, 409, { error: "job is not available" });
       }
       const jobResult = url.pathname.match(/^\/v1\/jobs\/([^/]+)\/(complete|fail|cancel)$/);
       if (jobResult && request.method === "POST") {
+        const actor = agentIdentity(request);
+        if (!actor) return sendJson(response, 401, { error: "x-agent-id is required" });
         const id = decodeURIComponent(jobResult[1]);
         const action = jobResult[2];
         const body = await readJson(request);
+        const existing = store.getJob(id);
+        if (!existing) return sendJson(response, 404, { error: "job not found" });
+        if (action === "cancel" && actor !== existing.requested_by && actor !== existing.target_agent) {
+          return sendJson(response, 403, { error: "agent is not authorized for this job" });
+        }
         const job = action === "complete"
-          ? store.completeJob(id, body.result)
+          ? store.completeJobBy(id, body.result, actor)
           : action === "fail"
-            ? store.failJob(id, body.error)
+            ? store.failJobBy(id, body.error, actor)
             : store.cancelJob(id);
-        if (!job) return sendJson(response, 404, { error: "job not found" });
+        if (!job) return sendJson(response, 403, { error: "agent is not authorized for this job" });
         publish(job.requested_by, `job.${job.status}`, job);
         return sendJson(response, 200, { job });
       }
@@ -157,6 +204,11 @@ export function createServer({ dbPath = "./data/agent-relay.db", token = process
 function authenticate(request, token) {
   if (!token) return true;
   return request.headers.authorization === `Bearer ${token}`;
+}
+
+function agentIdentity(request) {
+  const value = request.headers["x-agent-id"];
+  return typeof value === "string" && value ? value : null;
 }
 
 async function readJson(request) {

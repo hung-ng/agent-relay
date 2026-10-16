@@ -17,9 +17,15 @@ test("persists messages and job lifecycle", () => {
   store.registerAgent({ id: "codex@mini", hostId: "mini", kind: "codex" });
   const message = store.createMessage({ sender: "claude@book", recipient: "codex@mini", payload: { body: "hello" } });
   assert.equal(store.getMessages("codex@mini")[0].id, message.id);
+  store.markMessageDelivered(message.id);
+  assert.equal(store.getPendingWork("codex@mini").messages[0].id, message.id);
+  store.acknowledgeMessage(message.id);
+  assert.equal(store.markMessageDelivered(message.id).status, "acknowledged");
 
   const job = store.createJob({ kind: "network.probe", requestedBy: "claude@book", targetAgent: "codex@mini", payload: { checks: [] } });
   assert.equal(store.claimJob(job.id, "codex@mini").status, "running");
+  assert.equal(store.claimJob(job.id, "codex@mini").status, "running");
+  assert.equal(store.getPendingWork("codex@mini").jobs[0].id, job.id);
   assert.equal(store.completeJob(job.id, { ok: true }).status, "completed");
   assert.deepEqual(store.getJob(job.id).result, { ok: true });
   store.close();

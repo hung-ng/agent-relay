@@ -21,6 +21,7 @@ function responseFor() {
 test("MCP exposes tools and routes a message", async () => {
   const store = new Store(":memory:");
   store.registerAgent({ id: "codex@mini", hostId: "mini", kind: "codex" });
+  store.registerAgent({ id: "claude@book", hostId: "book", kind: "claude", capabilities: ["agent.task"] });
   const published = [];
   const handler = createMcpHandler({ store, publish: (...args) => published.push(args) });
 
@@ -40,5 +41,24 @@ test("MCP exposes tools and routes a message", async () => {
   }), messageResponse);
   assert.equal(JSON.parse(messageResponse.body).result.structuredContent.recipient, "codex@mini");
   assert.equal(published[0][0], "codex@mini");
+
+  const jobResponse = responseFor();
+  await handler(requestFor({
+    jsonrpc: "2.0",
+    id: 3,
+    method: "tools/call",
+    params: {
+      name: "dispatch_job",
+      arguments: {
+        requested_by: "codex@mini",
+        kind: "agent.task",
+        source_host: "book",
+        payload: { prompt: "check the service" }
+      }
+    }
+  }), jobResponse);
+  const job = JSON.parse(jobResponse.body).result.structuredContent;
+  assert.equal(job.target_agent, "claude@book");
+  assert.equal(job.required_capability, "agent.task");
   store.close();
 });
