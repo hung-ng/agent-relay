@@ -36,7 +36,7 @@ async function jsonRequest(app, method, url, body, headers) {
 }
 
 test("dispatch selects an agent with the requested capability", async (t) => {
-  const app = createServer({ dbPath: ":memory:" });
+  const app = createServer({ dbPath: ":memory:", token: "" });
   t.after(() => app.close());
 
   await jsonRequest(app, "POST", "/v1/agents/register", {
@@ -73,7 +73,7 @@ test("dispatch selects an agent with the requested capability", async (t) => {
 });
 
 test("readiness reports the relay is available", async (t) => {
-  const app = createServer({ dbPath: ":memory:" });
+  const app = createServer({ dbPath: ":memory:", token: "" });
   t.after(() => app.close());
 
   const { response, value } = await jsonRequest(app, "GET", "/readyz");

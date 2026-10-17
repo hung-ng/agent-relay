@@ -38,7 +38,7 @@ async function jsonRequest(app, method, url, body, headers = {}) {
 }
 
 test("worker replays unfinished work after reconnecting", async (t) => {
-  const app = createServer({ dbPath: ":memory:" });
+  const app = createServer({ dbPath: ":memory:", token: "" });
   t.after(() => app.close());
 
   await jsonRequest(app, "POST", "/v1/agents/register", { id: "probe@mini", host_id: "mini", kind: "probe", capabilities: ["network.probe"] });
