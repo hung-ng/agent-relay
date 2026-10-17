@@ -13,6 +13,7 @@ const data = process.env.AGENT_RELAY_DATA ?? (root ? path.join(root, "data") : u
 const logDir = process.env.AGENT_RELAY_LOG_DIR ?? (data ? path.join(data, "logs") : undefined);
 const values = {
   NODE_BIN: process.env.NODE_BIN ?? process.execPath,
+  AGENT_RELAY_PATH: process.env.AGENT_RELAY_PATH ?? process.env.PATH ?? "/usr/bin:/bin",
   AGENT_RELAY_ROOT: root,
   AGENT_RELAY_DATA: data,
   AGENT_RELAY_LOG_DIR: logDir,

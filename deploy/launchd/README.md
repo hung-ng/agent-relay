@@ -15,7 +15,7 @@ node scripts/render-launchd.mjs \
   "$HOME/Library/LaunchAgents/com.agent-relay.server.plist"
 ```
 
-For a worker, use `worker.env.example`. Give every worker a unique `AGENT_ID`, keep `HOST_ID` stable, and list the capabilities that its `Worker` implementation supports.
+For a worker, use `worker.env.example`. Give every worker a unique `AGENT_ID`, keep `HOST_ID` stable, list the capabilities that its `Worker` implementation supports, and render it from a shell where the worker CLI is on `PATH`. The renderer carries that `PATH` into launchd, whose default environment does not include user-level package managers.
 
 The renderer fails when a required value is missing, escapes values for XML, and writes the plist with mode `0600`. Run `plutil -lint` before loading it with `launchctl bootstrap`.
 
