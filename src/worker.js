@@ -174,7 +174,9 @@ export class Worker {
     const prompt = String(payload?.prompt ?? "");
     if (!prompt) throw new Error("agent.task requires payload.prompt");
     const command = this.command ?? this.kind;
-    const args = command === "claude" ? ["-p", prompt, "--output-format", "json"] : ["exec", prompt];
+    const args = command === "claude"
+      ? ["-p", prompt, "--output-format", "json"]
+      : ["exec", ...(payload?.execution_mode === "read_only" ? ["--sandbox", "read-only", "--ask-for-approval", "never"] : []), prompt];
     return runProcess(command, args, { cwd: payload.cwd ?? this.cwd });
   }
 
