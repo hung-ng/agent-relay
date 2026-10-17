@@ -1,6 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { Worker } from "../src/worker.js";
+import { Worker, agentTaskArgs } from "../src/worker.js";
+
+test("read-only Codex tasks use the installed noninteractive policy", () => {
+  assert.deepEqual(agentTaskArgs("codex", { execution_mode: "read_only", prompt: "inspect" }), [
+    "exec",
+    "--sandbox",
+    "read-only",
+    "--config",
+    'approval_policy="never"',
+    "inspect"
+  ]);
+  assert.deepEqual(agentTaskArgs("codex", { execution_mode: "write", prompt: "implement" }), ["exec", "implement"]);
+});
 
 test("agent workers turn requests into replies", async () => {
   const calls = [];

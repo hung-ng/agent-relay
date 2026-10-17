@@ -174,9 +174,7 @@ export class Worker {
     const prompt = String(payload?.prompt ?? "");
     if (!prompt) throw new Error("agent.task requires payload.prompt");
     const command = this.command ?? this.kind;
-    const args = command === "claude"
-      ? ["-p", prompt, "--output-format", "json"]
-      : ["exec", ...(payload?.execution_mode === "read_only" ? ["--sandbox", "read-only", "--ask-for-approval", "never"] : []), prompt];
+    const args = agentTaskArgs(command, payload);
     return runProcess(command, args, { cwd: payload.cwd ?? this.cwd });
   }
 
@@ -201,6 +199,15 @@ export class Worker {
       "x-agent-id": this.agentId
     };
   }
+}
+
+export function agentTaskArgs(command, payload = {}) {
+  if (command === "claude") return ["-p", String(payload.prompt ?? ""), "--output-format", "json"];
+  return [
+    "exec",
+    ...(payload.execution_mode === "read_only" ? ["--sandbox", "read-only", "--config", 'approval_policy="never"'] : []),
+    String(payload.prompt ?? "")
+  ];
 }
 
 function parseEvent(raw) {
