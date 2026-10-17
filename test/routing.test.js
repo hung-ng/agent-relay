@@ -127,6 +127,7 @@ test("worker actions require the matching authenticated agent", async (t) => {
 
   const { value: createdJob } = await jsonRequest(app, "POST", "/v1/jobs", {
     kind: "network.probe",
+    max_attempts: 2,
     requested_by: "claude@book",
     target_agent: "probe@mini",
     payload: { checks: [{ type: "dns", name: "localhost" }] }
@@ -157,4 +158,32 @@ test("worker actions require the matching authenticated agent", async (t) => {
     { ...auth, "x-agent-id": "claude@book" }
   );
   assert.equal(wrongCompletion.response.status, 403);
+
+  const retried = await jsonRequest(
+    app,
+    "POST",
+    `/v1/jobs/${encodeURIComponent(createdJob.job.id)}/fail`,
+    { error: "first attempt failed" },
+    { ...auth, "x-agent-id": "probe@mini" }
+  );
+  assert.equal(retried.response.status, 200);
+  assert.equal(retried.value.job.status, "queued");
+  assert.equal(retried.value.job.attempts, 1);
+
+  await jsonRequest(
+    app,
+    "POST",
+    `/v1/jobs/${encodeURIComponent(createdJob.job.id)}/claim`,
+    { agent_id: "probe@mini" },
+    { ...auth, "x-agent-id": "probe@mini" }
+  );
+  const deadLetter = await jsonRequest(
+    app,
+    "POST",
+    `/v1/jobs/${encodeURIComponent(createdJob.job.id)}/fail`,
+    { error: "second attempt failed" },
+    { ...auth, "x-agent-id": "probe@mini" }
+  );
+  assert.equal(deadLetter.value.job.status, "failed");
+  assert.equal(deadLetter.value.job.attempts, 2);
 });

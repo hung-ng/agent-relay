@@ -89,7 +89,7 @@ export class Worker {
         const raw = buffer.slice(0, boundary);
         buffer = buffer.slice(boundary + 2);
         const event = parseEvent(raw);
-        if (event?.event === "job.created") await this.handleJob(event.data);
+        if (event?.event === "job.created" || event?.event === "job.queued") await this.handleJob(event.data);
         if (event?.event === "message.created") await this.handleMessage(event.data);
       }
     }

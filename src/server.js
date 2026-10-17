@@ -112,6 +112,7 @@ export function createServer({ dbPath = "./data/agent-relay.db", token = process
         const job = store.createJob({
           kind: body.kind,
           requiredCapability,
+          maxAttempts: body.max_attempts,
           requestedBy: body.requested_by,
           targetAgent,
           sourceHost: body.source_host,
@@ -159,7 +160,7 @@ export function createServer({ dbPath = "./data/agent-relay.db", token = process
             ? store.failJobBy(id, body.error, actor)
             : store.cancelJob(id);
         if (!job) return sendJson(response, 403, { error: "agent is not authorized for this job" });
-        publish(job.requested_by, `job.${job.status}`, job);
+        publish(job.requested_by, job.status === "queued" ? "job.created" : `job.${job.status}`, job);
         return sendJson(response, 200, { job });
       }
       return sendJson(response, 404, { error: "not found" });

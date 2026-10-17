@@ -85,6 +85,7 @@ export function mcpTools() {
           requested_by: { type: "string" },
           kind: { type: "string" },
           capability: { type: "string" },
+          max_attempts: { type: "integer", minimum: 1, maximum: 10 },
           target_agent: { type: "string" },
           source_host: { type: "string" },
           target_host: { type: "string" },
@@ -220,6 +221,7 @@ async function callTool(name, args, { store, publish }) {
       const job = store.createJob({
         kind: args.kind,
         requiredCapability,
+        maxAttempts: args.max_attempts,
         requestedBy: args.requested_by,
         targetAgent,
         sourceHost: args.source_host ?? null,
@@ -236,6 +238,7 @@ async function callTool(name, args, { store, publish }) {
       const job = store.createJob({
         kind: "network.probe",
         requiredCapability: "network.probe",
+        maxAttempts: 3,
         requestedBy: args.requested_by,
         targetAgent,
         sourceHost: args.source_host,

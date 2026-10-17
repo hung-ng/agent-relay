@@ -45,6 +45,8 @@ export class Store {
         status TEXT NOT NULL DEFAULT 'queued',
         result TEXT,
         error TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        max_attempts INTEGER NOT NULL DEFAULT 3,
         created_at TEXT NOT NULL,
         started_at TEXT,
         completed_at TEXT,
@@ -61,6 +63,12 @@ export class Store {
     const jobColumns = this.db.prepare("PRAGMA table_info(jobs)").all();
     if (!jobColumns.some((column) => column.name === "required_capability")) {
       this.db.exec("ALTER TABLE jobs ADD COLUMN required_capability TEXT");
+    }
+    if (!jobColumns.some((column) => column.name === "attempts")) {
+      this.db.exec("ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0");
+    }
+    if (!jobColumns.some((column) => column.name === "max_attempts")) {
+      this.db.exec("ALTER TABLE jobs ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 3");
     }
   }
 
@@ -216,14 +224,15 @@ export class Store {
     return this.getMessage(id);
   }
 
-  createJob({ id, kind, requiredCapability = null, requestedBy, targetAgent = null, sourceHost = null, targetHost = null, payload = {} }) {
+  createJob({ id, kind, requiredCapability = null, maxAttempts = 3, requestedBy, targetAgent = null, sourceHost = null, targetHost = null, payload = {} }) {
     const jobId = id ?? randomUUID();
     const timestamp = now();
+    const boundedAttempts = Math.min(Math.max(Number(maxAttempts) || 3, 1), 10);
     this.db.prepare(`
       INSERT INTO jobs
-        (id, kind, required_capability, requested_by, target_agent, source_host, target_host, payload, status, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)
-    `).run(jobId, kind, requiredCapability, requestedBy, targetAgent, sourceHost, targetHost, JSON.stringify(payload), timestamp);
+        (id, kind, required_capability, requested_by, target_agent, source_host, target_host, payload, status, attempts, max_attempts, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?)
+    `).run(jobId, kind, requiredCapability, requestedBy, targetAgent, sourceHost, targetHost, JSON.stringify(payload), boundedAttempts, timestamp);
     return this.getJob(jobId);
   }
 
@@ -236,7 +245,7 @@ export class Store {
     const timestamp = now();
     const result = this.db.prepare(`
       UPDATE jobs
-      SET status = 'running', claimed_by = ?, started_at = ?
+      SET status = 'running', claimed_by = ?, started_at = ?, attempts = attempts + 1
       WHERE id = ? AND status = 'queued' AND (target_agent IS NULL OR target_agent = ?)
     `).run(agentId, timestamp, id, agentId);
     if (result.changes > 0) return this.getJob(id);
@@ -270,10 +279,18 @@ export class Store {
         WHERE id = ? AND status = 'running'
       `).run(JSON.stringify(values.result ?? {}), timestamp, id);
     } else {
-      this.db.prepare(`
-        UPDATE jobs SET status = 'failed', error = ?, completed_at = ?
-        WHERE id = ? AND status IN ('queued', 'running')
-      `).run(String(values.error), timestamp, id);
+      const terminal = existing.attempts >= existing.max_attempts;
+      if (terminal) {
+        this.db.prepare(`
+          UPDATE jobs SET status = 'failed', error = ?, completed_at = ?
+          WHERE id = ? AND status = 'running'
+        `).run(String(values.error), timestamp, id);
+      } else {
+        this.db.prepare(`
+          UPDATE jobs SET status = 'queued', error = ?, completed_at = NULL, started_at = NULL, claimed_by = NULL
+          WHERE id = ? AND status = 'running'
+        `).run(String(values.error), id);
+      }
     }
     return this.getJob(id);
   }
@@ -328,6 +345,8 @@ export class Store {
       status: row.status,
       result: row.result ? JSON.parse(row.result) : null,
       error: row.error,
+      attempts: row.attempts,
+      max_attempts: row.max_attempts,
       created_at: row.created_at,
       started_at: row.started_at,
       completed_at: row.completed_at,

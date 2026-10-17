@@ -40,3 +40,27 @@ test("monitor checks relay health and the expected online capability", async () 
   assert.equal(result.ok, true);
   assert.equal(result.agent.id, "probe@test");
 });
+
+test("failed jobs retry up to max attempts, then become failed", () => {
+  const store = new Store(":memory:");
+  const job = store.createJob({
+    kind: "agent.task",
+    requiredCapability: "agent.task",
+    maxAttempts: 2,
+    requestedBy: "service-monitor",
+    targetAgent: "codex@test",
+    payload: { prompt: "fail twice" }
+  });
+
+  assert.equal(store.claimJob(job.id, "codex@test").attempts, 1);
+  assert.equal(store.failJobBy(job.id, "first failure", "codex@test").status, "queued");
+  assert.equal(store.getPendingWork("codex@test").jobs[0].id, job.id);
+  assert.equal(store.claimJob(job.id, "codex@test").attempts, 2);
+  const failed = store.failJobBy(job.id, "second failure", "codex@test");
+
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.attempts, 2);
+  assert.equal(failed.max_attempts, 2);
+  assert.equal(failed.error, "second failure");
+  store.close();
+});
