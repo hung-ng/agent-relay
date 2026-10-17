@@ -1,8 +1,9 @@
 import { spawn } from "node:child_process";
 import { runProbe } from "./probes.js";
+import { requestJson } from "./http.js";
 
 export class Worker {
-  constructor({ serverUrl, agentId, hostId, kind = "probe", capabilities = ["network.probe"], token = "", command = null, cwd = process.cwd(), logger = console }) {
+  constructor({ serverUrl, agentId, hostId, kind = "probe", capabilities = ["network.probe"], token = "", command = null, cwd = process.cwd(), allowWrite = false, logger = console }) {
     this.serverUrl = serverUrl.replace(/\/$/, "");
     this.agentId = agentId;
     this.hostId = hostId;
@@ -11,6 +12,7 @@ export class Worker {
     this.token = token;
     this.command = command;
     this.cwd = cwd;
+    this.allowWrite = allowWrite || capabilities.includes("agent.task.write");
     this.logger = logger;
     this.stopped = false;
     this.abortController = new AbortController();
@@ -173,24 +175,20 @@ export class Worker {
   async runAgentTask(payload) {
     const prompt = String(payload?.prompt ?? "");
     if (!prompt) throw new Error("agent.task requires payload.prompt");
+    if (payload?.execution_mode === "write" && !this.allowWrite) {
+      throw new Error("write workflow requires an agent.task.write capability");
+    }
     const command = this.command ?? this.kind;
-    const args = agentTaskArgs(command, payload);
+    const args = agentTaskArgs(command, { ...payload, allow_write: this.allowWrite });
     return runProcess(command, args, { cwd: payload.cwd ?? this.cwd });
   }
 
   async request(path, { method = "GET", body } = {}) {
-    const response = await fetch(`${this.serverUrl}${path}`, {
+    return requestJson(`${this.serverUrl}${path}`, {
       method,
-      headers: { ...this.headers(), ...(body ? { "content-type": "application/json" } : {}) },
-      body: body ? JSON.stringify(body) : undefined
+      headers: { ...this.headers(), ...(body === undefined ? {} : { "content-type": "application/json" }) },
+      body
     });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      const error = new Error(data.error ?? `request failed: ${response.status}`);
-      error.status = response.status;
-      throw error;
-    }
-    return data;
   }
 
   headers() {
@@ -205,7 +203,11 @@ export function agentTaskArgs(command, payload = {}) {
   if (command === "claude") return ["-p", String(payload.prompt ?? ""), "--output-format", "json"];
   return [
     "exec",
-    ...(payload.execution_mode === "read_only" ? ["--sandbox", "read-only", "--config", 'approval_policy="never"'] : []),
+    ...(payload.execution_mode === "read_only"
+      ? ["--sandbox", "read-only", "--config", 'approval_policy="never"']
+      : payload.execution_mode === "write" && payload.allow_write
+        ? ["--sandbox", "workspace-write", "--config", 'approval_policy="never"']
+        : []),
     String(payload.prompt ?? "")
   ];
 }

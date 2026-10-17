@@ -12,6 +12,14 @@ test("read-only Codex tasks use the installed noninteractive policy", () => {
     "inspect"
   ]);
   assert.deepEqual(agentTaskArgs("codex", { execution_mode: "write", prompt: "implement" }), ["exec", "implement"]);
+  assert.deepEqual(agentTaskArgs("codex", { execution_mode: "write", allow_write: true, prompt: "implement" }), [
+    "exec",
+    "--sandbox",
+    "workspace-write",
+    "--config",
+    'approval_policy="never"',
+    "implement"
+  ]);
 });
 
 test("agent workers turn requests into replies", async () => {

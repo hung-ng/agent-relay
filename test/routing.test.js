@@ -70,6 +70,38 @@ test("dispatch selects an agent with the requested capability", async (t) => {
     payload: { checks: [{ type: "dns", name: "localhost" }] }
   });
   assert.equal(incompatibleTarget.response.status, 409);
+
+  const workflowOnClaude = await jsonRequest(app, "POST", "/v1/jobs", {
+    kind: "agent.task",
+    requested_by: "service-monitor",
+    target_agent: "claude@mini",
+    payload: { workflow: "review", execution_mode: "read_only", prompt: "inspect" }
+  });
+  assert.equal(workflowOnClaude.response.status, 409);
+
+  await jsonRequest(app, "POST", "/v1/agents/register", {
+    id: "codex@mini",
+    host_id: "mini",
+    kind: "codex",
+    capabilities: ["agent.task"]
+  });
+
+  const writeWorkflow = await jsonRequest(app, "POST", "/v1/jobs", {
+    kind: "agent.task",
+    requested_by: "service-monitor",
+    target_agent: "codex@mini",
+    payload: { workflow: "implement", execution_mode: "write", prompt: "edit" }
+  });
+  assert.equal(writeWorkflow.response.status, 409);
+
+  const bypassedWriteWorkflow = await jsonRequest(app, "POST", "/v1/jobs", {
+    kind: "agent.task",
+    capability: "agent.task",
+    requested_by: "service-monitor",
+    target_agent: "codex@mini",
+    payload: { workflow: "implement", execution_mode: "write", prompt: "edit" }
+  });
+  assert.equal(bypassedWriteWorkflow.response.status, 409);
 });
 
 test("readiness reports the relay is available", async (t) => {
@@ -186,4 +218,48 @@ test("worker actions require the matching authenticated agent", async (t) => {
   );
   assert.equal(deadLetter.value.job.status, "failed");
   assert.equal(deadLetter.value.job.attempts, 2);
+});
+
+test("a retry wakes the target worker instead of only the requester", async (t) => {
+  const app = createServer({ dbPath: ":memory:", token: "" });
+  t.after(() => app.close());
+  await jsonRequest(app, "POST", "/v1/agents/register", {
+    id: "probe@mini",
+    host_id: "mini",
+    kind: "probe",
+    capabilities: ["network.probe"]
+  });
+
+  const events = [];
+  let resolveRetry;
+  const retryEvent = new Promise((resolve) => { resolveRetry = resolve; });
+  const eventRequest = { ...requestFor("GET", "/v1/events?agent_id=probe%40mini", undefined, { "x-agent-id": "probe@mini" }), on() {} };
+  let closeResponse;
+  const eventResponse = {
+    writeHead() {},
+    write(chunk) {
+      events.push(String(chunk));
+      if (events.length === 2) resolveRetry(events[1]);
+    },
+    end() { closeResponse?.(); },
+    on(event, handler) { if (event === "close") closeResponse = handler; }
+  };
+  app.server.emit("request", eventRequest, eventResponse);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const { value: created } = await jsonRequest(app, "POST", "/v1/jobs", {
+    kind: "network.probe",
+    requested_by: "service-monitor",
+    target_agent: "probe@mini",
+    payload: { checks: [] }
+  });
+  await jsonRequest(app, "POST", `/v1/jobs/${created.job.id}/claim`, { agent_id: "probe@mini" }, { "x-agent-id": "probe@mini" });
+  await jsonRequest(app, "POST", `/v1/jobs/${created.job.id}/fail`, { error: "retry me" }, { "x-agent-id": "probe@mini" });
+
+  const event = await Promise.race([
+    retryEvent,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("retry event timed out")), 1000))
+  ]);
+  assert.match(event, /event: job\.created/);
+  assert.match(event, new RegExp(created.job.id));
 });

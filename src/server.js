@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { Store } from "./store.js";
 import { createMcpHandler } from "./mcp.js";
+import { normalizeJobPayload, requiredCapabilityForJob } from "./routing.js";
 
 export function createServer({ dbPath = "./data/agent-relay.db", token = process.env.AGENT_RELAY_TOKEN ?? "" } = {}) {
   fs.mkdirSync(path.dirname(path.resolve(dbPath)), { recursive: true });
@@ -103,19 +104,21 @@ export function createServer({ dbPath = "./data/agent-relay.db", token = process
       if (url.pathname === "/v1/jobs" && request.method === "POST") {
         const body = await readJson(request);
         if (!body.kind || !body.requested_by) return sendJson(response, 400, { error: "kind and requested_by are required" });
-        const requiredCapability = body.capability ?? body.kind;
+        const payload = normalizeJobPayload({
+          kind: body.kind,
+          payload: body.payload,
+          sourceHost: body.source_host,
+          targetHost: body.target_host
+        });
+        const requiredCapability = requiredCapabilityForJob({ kind: body.kind, capability: body.capability, payload });
         const targetAgent = body.target_agent ?? (body.source_host ? store.findAgentForHost(body.source_host, requiredCapability)?.id : null);
         if (!targetAgent) return sendJson(response, 409, { error: "no target agent is registered" });
         if (!store.agentSupports(targetAgent, requiredCapability)) {
           return sendJson(response, 409, { error: "target agent does not provide the required capability" });
         }
-        const payload = body.kind === "network.probe"
-          ? {
-              ...(body.payload ?? {}),
-              source_host: body.source_host ?? body.payload?.source_host ?? null,
-              target_host: body.target_host ?? body.payload?.target_host ?? null
-            }
-          : body.payload ?? {};
+        if (payload.workflow && store.getAgent(targetAgent)?.kind !== "codex") {
+          return sendJson(response, 409, { error: "workflow tasks require a codex agent" });
+        }
         const job = store.createJob({
           kind: body.kind,
           requiredCapability,
@@ -167,7 +170,11 @@ export function createServer({ dbPath = "./data/agent-relay.db", token = process
             ? store.failJobBy(id, body.error, actor)
             : store.cancelJob(id);
         if (!job) return sendJson(response, 403, { error: "agent is not authorized for this job" });
-        publish(job.requested_by, job.status === "queued" ? "job.created" : `job.${job.status}`, job);
+        const event = job.status === "queued" ? "job.created" : `job.${job.status}`;
+        publish(job.status === "queued" ? job.target_agent : job.requested_by, event, job);
+        if (job.status === "queued" && job.requested_by && job.requested_by !== job.target_agent) {
+          publish(job.requested_by, event, job);
+        }
         return sendJson(response, 200, { job });
       }
       return sendJson(response, 404, { error: "not found" });

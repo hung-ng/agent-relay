@@ -1,16 +1,29 @@
 #!/usr/bin/env node
 import process from "node:process";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { createServer } from "./server.js";
 import { Worker } from "./worker.js";
 import { buildTaskPayload, listWorkflows } from "./workflows.js";
+import { requestJson } from "./http.js";
 
-const [command = "help", ...args] = process.argv.slice(2);
-const options = parseArgs(args);
+export async function main(argv = process.argv.slice(2)) {
+  const [command = "help", ...rawArgs] = argv;
+  const taskAction = command === "task" && rawArgs[0] && !rawArgs[0].startsWith("--") ? rawArgs.shift() : "run";
+  const options = parseArgs(rawArgs);
+  try {
+    if (command === "server") await runServer(options);
+    else if (command === "worker") await runWorker(options);
+    else if (command === "task") await runTask(taskAction, options);
+    else printHelp();
+  } catch (error) {
+    console.error(`agent-relay ${command} failed: ${error.message}`);
+    process.exitCode = 1;
+  }
+}
 
-if (command === "server") await runServer(options);
-else if (command === "worker") await runWorker(options);
-else if (command === "task") await runTask(options);
-else printHelp();
+const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) await main();
 
 async function runServer(options) {
   const port = Number(options.port ?? process.env.PORT ?? 8787);
@@ -40,9 +53,40 @@ async function runWorker(options) {
   process.once("SIGTERM", shutdown);
 }
 
-async function runTask(options) {
+async function runTask(action, options) {
   const server = options.server ?? process.env.AGENT_RELAY_URL;
   const requestedBy = options.requested_by ?? process.env.AGENT_ID ?? "cli@local";
+  const headers = {
+    ...(options.token ?? process.env.AGENT_RELAY_TOKEN
+      ? { authorization: `Bearer ${options.token ?? process.env.AGENT_RELAY_TOKEN}` }
+      : {}),
+    ...(action === "cancel" ? { "x-agent-id": requestedBy } : {}),
+    "content-type": "application/json"
+  };
+  const jobId = options.job_id ?? options.id;
+  if (["status", "wait", "cancel"].includes(action)) {
+    if (!server || !jobId) {
+      console.error(`task ${action} requires --server and --job-id`);
+      process.exitCode = 2;
+      return;
+    }
+    if (action === "cancel") {
+      const result = await requestJson(`${server.replace(/\/$/, "")}/v1/jobs/${encodeURIComponent(jobId)}/cancel`, {
+        method: "POST",
+        headers,
+        body: {}
+      });
+      console.log(JSON.stringify(result.job, null, 2));
+      return;
+    }
+    const job = action === "status"
+      ? await getJob(server, jobId, headers)
+      : (await waitForJob(server, jobId, { headers, timeoutMs: parseWaitMs(options.wait_ms) })).job;
+    console.log(JSON.stringify(job, null, 2));
+    if (action === "wait" && !isTerminal(job.status)) process.exitCode = 3;
+    if (["failed", "cancelled"].includes(job.status)) process.exitCode = 1;
+    return;
+  }
   const targetAgent = options.target_agent ?? null;
   const sourceHost = options.source_host ?? null;
   if (!server || (!targetAgent && !sourceHost)) {
@@ -64,15 +108,9 @@ async function runTask(options) {
     return;
   }
 
-  const headers = {
-    ...(options.token ?? process.env.AGENT_RELAY_TOKEN
-      ? { authorization: `Bearer ${options.token ?? process.env.AGENT_RELAY_TOKEN}` }
-      : {}),
-    "content-type": "application/json"
-  };
   const body = {
     kind: "agent.task",
-    capability: "agent.task",
+    capability: payload.execution_mode === "write" ? "agent.task.write" : "agent.task",
     requested_by: requestedBy,
     target_agent: targetAgent,
     source_host: sourceHost,
@@ -80,33 +118,40 @@ async function runTask(options) {
     max_attempts: options.max_attempts === undefined ? undefined : Number(options.max_attempts),
     payload
   };
-  const created = await requestJson(server, "/v1/jobs", { method: "POST", headers, body });
-  const waitMs = Math.min(Math.max(Number(options.wait_ms ?? 30000) || 30000, 0), 300000);
-  const job = waitMs === 0
-    ? created.job
+  const created = await requestJson(`${server.replace(/\/$/, "")}/v1/jobs`, { method: "POST", headers, body });
+  const waitMs = parseWaitMs(options.wait_ms);
+  const waited = waitMs === 0
+    ? { job: created.job, timedOut: false }
     : await waitForJob(server, created.job.id, { headers, timeoutMs: waitMs });
+  const job = waited.job;
   console.log(JSON.stringify(job, null, 2));
+  if (waited.timedOut) process.exitCode = 3;
   if (["failed", "cancelled"].includes(job.status)) process.exitCode = 1;
+}
+
+async function getJob(server, id, headers) {
+  const result = await requestJson(`${server.replace(/\/$/, "")}/v1/jobs/${encodeURIComponent(id)}`, { headers });
+  return result.job;
 }
 
 async function waitForJob(server, id, { headers, timeoutMs }) {
   const deadline = Date.now() + timeoutMs;
   while (true) {
-    const { job } = await requestJson(server, `/v1/jobs/${encodeURIComponent(id)}`, { headers });
-    if (["completed", "failed", "cancelled"].includes(job.status) || Date.now() >= deadline) return job;
+    const job = await getJob(server, id, headers);
+    if (isTerminal(job.status)) return { job, timedOut: false };
+    if (Date.now() >= deadline) return { job, timedOut: true };
     await delay(Math.min(500, Math.max(deadline - Date.now(), 1)));
   }
 }
 
-async function requestJson(server, route, { method = "GET", headers = {}, body } = {}) {
-  const response = await fetch(`${server.replace(/\/$/, "")}${route}`, {
-    method,
-    headers,
-    body: body ? JSON.stringify(body) : undefined
-  });
-  const value = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(value.error ?? `request failed: ${response.status}`);
-  return value;
+export function parseWaitMs(value) {
+  if (value === undefined) return 30000;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.min(Math.max(parsed, 0), 300000) : 30000;
+}
+
+function isTerminal(status) {
+  return ["completed", "failed", "cancelled"].includes(status);
 }
 
 function delay(ms) {
@@ -125,5 +170,5 @@ function parseArgs(args) {
 }
 
 function printHelp() {
-  console.log(`agent-relay\n\nCommands:\n  agent-relay server [--host 127.0.0.1] [--port 8787] [--db ./data/agent-relay.db]\n  agent-relay worker --server http://... --agent claude@macbook --host macbook --kind probe\n  agent-relay task --server https://... --target-agent codex@macbook --prompt "..." [--workflow prompt]\n\nTask workflows:\n${listWorkflows().map(({ name, description }) => `  ${name.padEnd(10)} ${description}`).join("\n")}\n\nEnvironment:\n  AGENT_RELAY_TOKEN  Require Bearer authentication when set.\n  AGENT_RELAY_URL    Worker server URL.\n  AGENT_ID           Worker agent ID or default requester.\n  HOST_ID            Worker host ID.`);
+  console.log(`agent-relay\n\nCommands:\n  agent-relay server [--host 127.0.0.1] [--port 8787] [--db ./data/agent-relay.db]\n  agent-relay worker --server http://... --agent claude@macbook --host macbook --kind probe\n  agent-relay task --server https://... --target-agent codex@macbook --prompt "..." [--workflow prompt]\n  agent-relay task status --server https://... --job-id ID\n  agent-relay task wait --server https://... --job-id ID [--wait-ms 30000]\n  agent-relay task cancel --server https://... --job-id ID\n\nTask workflows:\n${listWorkflows().map(({ name, description }) => `  ${name.padEnd(10)} ${description}`).join("\n")}\n\nEnvironment:\n  AGENT_RELAY_TOKEN  Require Bearer authentication when set.\n  AGENT_RELAY_URL    Worker server URL.\n  AGENT_ID           Worker agent ID or default requester.\n  HOST_ID            Worker host ID.`);
 }

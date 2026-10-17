@@ -25,7 +25,7 @@ const WORKFLOWS = {
     ].join("\n\n")
   },
   implement: {
-    description: "Implement the requested repository change and run relevant validation.",
+    description: "Implement the requested repository change on a write-enabled Codex worker.",
     executionMode: "write",
     build: ({ prompt }) => [
       "Implement this task in the current repository.",

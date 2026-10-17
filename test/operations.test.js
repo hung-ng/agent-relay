@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { Store } from "../src/store.js";
 import { backupDatabase } from "../scripts/backup-db.mjs";
-import { checkRelay } from "../scripts/monitor-relay.mjs";
+import { checkRelay, runMonitor } from "../scripts/monitor-relay.mjs";
 
 test("backs up SQLite data, checks integrity, and prunes old backups", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "agent-relay-backup-"));
@@ -39,6 +39,31 @@ test("monitor checks relay health and the expected online capability", async () 
   });
   assert.equal(result.ok, true);
   assert.equal(result.agent.id, "probe@test");
+});
+
+test("monitor can authenticate with the rendered token environment", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "agent-relay-monitor-"));
+  const requests = [];
+  const responses = {
+    "/healthz": { ok: true, service: "agent-relay" },
+    "/readyz": { ok: true, service: "agent-relay" },
+    "/v1/agents": { agents: [{ id: "probe@test", status: "online", capabilities: ["network.probe"] }] }
+  };
+  const result = await runMonitor({
+    token: "secret",
+    tokenFile: path.join(root, "missing.token"),
+    logFile: path.join(root, "logs", "monitor.log"),
+    stateFile: path.join(root, "monitor-state.json"),
+    expectedAgentId: "probe@test",
+    expectedCapability: "network.probe",
+    fetchImpl: async (url, options) => {
+      requests.push({ url, authorization: options.headers.authorization });
+      return { ok: true, status: 200, async json() { return responses[new URL(url).pathname]; } };
+    }
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(new Set(requests.map(({ authorization }) => authorization)), new Set(["Bearer secret"]));
+  await rm(root, { recursive: true, force: true });
 });
 
 test("failed jobs retry up to max attempts, then become failed", () => {

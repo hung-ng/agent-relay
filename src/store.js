@@ -1,5 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
+import { supportsCapability } from "./routing.js";
 
 const now = () => new Date().toISOString();
 
@@ -122,7 +123,7 @@ export class Store {
     ).all(hostId);
     const match = rows.find((row) => {
       const capabilities = JSON.parse(row.capabilities);
-      return !capability || capabilities.includes(capability);
+      return supportsCapability(capabilities, capability);
     });
     return match ? this.#agent(match) : null;
   }
@@ -130,7 +131,7 @@ export class Store {
   agentSupports(agentId, capability) {
     this.markStale();
     const agent = this.getAgent(agentId);
-    return Boolean(agent && agent.status === "online" && (!capability || agent.capabilities.includes(capability)));
+    return Boolean(agent && agent.status === "online" && supportsCapability(agent.capabilities, capability));
   }
 
   markStale(maxAgeMs = 45_000) {

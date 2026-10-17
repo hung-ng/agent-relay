@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { normalizeJobPayload, requiredCapabilityForJob } from "./routing.js";
 
 const SERVER_INFO = {
   name: "agent-relay",
@@ -214,17 +215,17 @@ async function callTool(name, args, { store, publish }) {
       if (!value) throw new Error(`message not found: ${args.message_id}`);
       break;
     case "dispatch_job": {
-      const requiredCapability = args.capability ?? args.kind;
+      const payload = normalizeJobPayload({
+        kind: args.kind,
+        payload: args.payload,
+        sourceHost: args.source_host,
+        targetHost: args.target_host
+      });
+      const requiredCapability = requiredCapabilityForJob({ kind: args.kind, capability: args.capability, payload });
       const targetAgent = args.target_agent ?? (args.source_host ? store.findAgentForHost(args.source_host, requiredCapability)?.id : null);
       if (!targetAgent) throw new Error("no target agent is registered for this job");
       if (!store.agentSupports(targetAgent, requiredCapability)) throw new Error("target agent does not provide the required capability");
-      const payload = args.kind === "network.probe"
-        ? {
-            ...(args.payload ?? {}),
-            source_host: args.source_host ?? args.payload?.source_host ?? null,
-            target_host: args.target_host ?? args.payload?.target_host ?? null
-          }
-        : args.payload ?? {};
+      if (payload.workflow && store.getAgent(targetAgent)?.kind !== "codex") throw new Error("workflow tasks require a codex agent");
       const job = store.createJob({
         kind: args.kind,
         requiredCapability,
