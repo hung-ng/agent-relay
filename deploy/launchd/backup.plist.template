@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agent-relay.backup</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@@NODE_BIN@@</string>
+    <string>@@AGENT_RELAY_ROOT@@/scripts/backup-db.mjs</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>@@AGENT_RELAY_ROOT@@</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AGENT_RELAY_DB</key>
+    <string>@@AGENT_RELAY_DATA@@/agent-relay.db</string>
+    <key>AGENT_RELAY_BACKUP_DIR</key>
+    <string>@@AGENT_RELAY_DATA@@/backups</string>
+    <key>AGENT_RELAY_BACKUP_RETENTION</key>
+    <string>@@AGENT_RELAY_BACKUP_RETENTION@@</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>3</integer>
+    <key>Minute</key>
+    <integer>15</integer>
+  </dict>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>@@AGENT_RELAY_LOG_DIR@@/backup.log</string>
+  <key>StandardErrorPath</key>
+  <string>@@AGENT_RELAY_LOG_DIR@@/backup.error.log</string>
+</dict>
+</plist>

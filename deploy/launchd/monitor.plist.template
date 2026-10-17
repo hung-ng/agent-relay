@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agent-relay.monitor</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@@NODE_BIN@@</string>
+    <string>@@AGENT_RELAY_ROOT@@/scripts/monitor-relay.mjs</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>@@AGENT_RELAY_ROOT@@</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AGENT_RELAY_MONITOR_URL</key>
+    <string>@@AGENT_RELAY_MONITOR_URL@@</string>
+    <key>AGENT_RELAY_TOKEN_FILE</key>
+    <string>@@AGENT_RELAY_TOKEN_FILE@@</string>
+    <key>AGENT_RELAY_MONITOR_AGENT_ID</key>
+    <string>@@AGENT_RELAY_MONITOR_AGENT_ID@@</string>
+    <key>AGENT_RELAY_MONITOR_CAPABILITY</key>
+    <string>@@AGENT_RELAY_MONITOR_CAPABILITY@@</string>
+    <key>AGENT_RELAY_MONITOR_LOG</key>
+    <string>@@AGENT_RELAY_DATA@@/logs/monitor.log</string>
+    <key>AGENT_RELAY_MONITOR_STATE</key>
+    <string>@@AGENT_RELAY_DATA@@/monitor-state.json</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>60</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>@@AGENT_RELAY_LOG_DIR@@/monitor.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>@@AGENT_RELAY_LOG_DIR@@/monitor.stderr.log</string>
+</dict>
+</plist>

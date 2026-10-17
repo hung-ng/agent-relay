@@ -9,7 +9,9 @@
   "scripts": {
     "start": "node src/cli.js server",
     "test": "node --test",
-    "smoke": "node scripts/smoke.mjs"
+    "smoke": "node scripts/smoke.mjs",
+    "backup": "node scripts/backup-db.mjs",
+    "monitor": "node scripts/monitor-relay.mjs"
   },
   "engines": {
     "node": ">=22.5"
