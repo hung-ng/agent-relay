@@ -109,6 +109,13 @@ export function createServer({ dbPath = "./data/agent-relay.db", token = process
         if (!store.agentSupports(targetAgent, requiredCapability)) {
           return sendJson(response, 409, { error: "target agent does not provide the required capability" });
         }
+        const payload = body.kind === "network.probe"
+          ? {
+              ...(body.payload ?? {}),
+              source_host: body.source_host ?? body.payload?.source_host ?? null,
+              target_host: body.target_host ?? body.payload?.target_host ?? null
+            }
+          : body.payload ?? {};
         const job = store.createJob({
           kind: body.kind,
           requiredCapability,
@@ -117,7 +124,7 @@ export function createServer({ dbPath = "./data/agent-relay.db", token = process
           targetAgent,
           sourceHost: body.source_host,
           targetHost: body.target_host,
-          payload: body.payload ?? {}
+          payload
         });
         publish(targetAgent, "job.created", job);
         return sendJson(response, 201, { job });

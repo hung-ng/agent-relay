@@ -218,6 +218,13 @@ async function callTool(name, args, { store, publish }) {
       const targetAgent = args.target_agent ?? (args.source_host ? store.findAgentForHost(args.source_host, requiredCapability)?.id : null);
       if (!targetAgent) throw new Error("no target agent is registered for this job");
       if (!store.agentSupports(targetAgent, requiredCapability)) throw new Error("target agent does not provide the required capability");
+      const payload = args.kind === "network.probe"
+        ? {
+            ...(args.payload ?? {}),
+            source_host: args.source_host ?? args.payload?.source_host ?? null,
+            target_host: args.target_host ?? args.payload?.target_host ?? null
+          }
+        : args.payload ?? {};
       const job = store.createJob({
         kind: args.kind,
         requiredCapability,
@@ -226,7 +233,7 @@ async function callTool(name, args, { store, publish }) {
         targetAgent,
         sourceHost: args.source_host ?? null,
         targetHost: args.target_host ?? null,
-        payload: args.payload ?? {}
+        payload
       });
       publish(targetAgent, "job.created", job);
       value = job;
