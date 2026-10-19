@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { normalizeJobPayload, requiredCapabilityForJob } from "./routing.js";
+import { readJsonBody } from "./body.js";
 
 const SERVER_INFO = {
   name: "agent-relay",
@@ -39,7 +40,8 @@ export function mcpTools() {
           recipient: { type: "string" },
           body: { type: "string" },
           type: { type: "string" },
-          conversation_id: { type: "string" }
+          conversation_id: { type: "string" },
+          id: { type: "string" }
         }
       }
     },
@@ -86,6 +88,7 @@ export function mcpTools() {
           requested_by: { type: "string" },
           kind: { type: "string" },
           capability: { type: "string" },
+          id: { type: "string" },
           max_attempts: { type: "integer", minimum: 1, maximum: 10 },
           target_agent: { type: "string" },
           source_host: { type: "string" },
@@ -102,6 +105,7 @@ export function mcpTools() {
         required: ["requested_by", "source_host", "checks"],
         properties: {
           requested_by: { type: "string" },
+          id: { type: "string" },
           source_host: { type: "string" },
           target_host: { type: "string" },
           checks: { type: "array", items: { type: "object" } },
@@ -137,7 +141,7 @@ export function createMcpHandler({ store, publish }) {
   return async function handleMcp(request, response) {
     let body;
     try {
-      body = await readJson(request);
+      body = await readJsonBody(request);
     } catch (error) {
       return sendJson(response, 400, jsonRpcError(null, -32700, error.message));
     }
@@ -194,6 +198,7 @@ async function callTool(name, args, { store, publish }) {
       break;
     case "send_message": {
       const message = store.createMessage({
+        id: args.id,
         sender: args.sender,
         recipient: args.recipient,
         type: args.type ?? "message",
@@ -227,6 +232,7 @@ async function callTool(name, args, { store, publish }) {
       if (!store.agentSupports(targetAgent, requiredCapability)) throw new Error("target agent does not provide the required capability");
       if (payload.workflow && store.getAgent(targetAgent)?.kind !== "codex") throw new Error("workflow tasks require a codex agent");
       const job = store.createJob({
+        id: args.id,
         kind: args.kind,
         requiredCapability,
         maxAttempts: args.max_attempts,
@@ -244,6 +250,7 @@ async function callTool(name, args, { store, publish }) {
       const targetAgent = store.findAgentForHost(args.source_host, "network.probe")?.id;
       if (!targetAgent) throw new Error(`no network probe worker is registered for ${args.source_host}`);
       const job = store.createJob({
+        id: args.id,
         kind: "network.probe",
         requiredCapability: "network.probe",
         maxAttempts: 3,
@@ -299,15 +306,8 @@ async function waitForMessage(store, agentId, timeoutMs = 10000) {
   return null;
 }
 
-async function readJson(request) {
-  const chunks = [];
-  for await (const chunk of request) chunks.push(chunk);
-  const text = Buffer.concat(chunks).toString("utf8");
-  if (!text) return {};
-  return JSON.parse(text);
-}
-
 function sendJson(response, status, payload) {
+  if (response.writableEnded || response.destroyed) return;
   response.writeHead(status, { "content-type": "application/json; charset=utf-8" });
   response.end(JSON.stringify(payload));
 }

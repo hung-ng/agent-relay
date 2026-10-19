@@ -17,3 +17,11 @@ test("reports unsupported probes without aborting the result", async () => {
   assert.equal(result.ok, false);
   assert.match(result.checks[0].error, /unsupported probe type/);
 });
+
+test("reports malformed checks without aborting the probe", async () => {
+  const result = await runProbe({ checks: [null, { type: "dns", name: "localhost" }] });
+  assert.equal(result.ok, false);
+  assert.equal(result.checks[0].type, "invalid");
+  assert.match(result.checks[0].error, /check must be an object/);
+  assert.equal(result.checks[1].ok, true);
+});

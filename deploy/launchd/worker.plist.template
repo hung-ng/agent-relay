@@ -28,6 +28,8 @@
     <string>@@AGENT_RELAY_PATH@@</string>
     <key>AGENT_RELAY_TOKEN</key>
     <string>@@AGENT_RELAY_TOKEN@@</string>
+    <key>AGENT_RELAY_TASK_TIMEOUT_MS</key>
+    <string>@@AGENT_RELAY_TASK_TIMEOUT_MS@@</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

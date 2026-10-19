@@ -220,6 +220,37 @@ test("worker actions require the matching authenticated agent", async (t) => {
   assert.equal(deadLetter.value.job.attempts, 2);
 });
 
+test("rejects capability bypasses and malformed JSON bodies", async (t) => {
+  const app = createServer({ dbPath: ":memory:", token: "" });
+  t.after(() => app.close());
+  await jsonRequest(app, "POST", "/v1/agents/register", {
+    id: "probe@mini",
+    host_id: "mini",
+    kind: "probe",
+    capabilities: null
+  });
+
+  const bypass = await jsonRequest(app, "POST", "/v1/jobs", {
+    kind: "network.probe",
+    capability: "",
+    requested_by: "service-monitor",
+    target_agent: "probe@mini",
+    payload: { checks: [] }
+  });
+  assert.equal(bypass.response.status, 409);
+
+  const invalidRequest = requestFor("POST", "/v1/messages", undefined);
+  invalidRequest[Symbol.asyncIterator] = async function* () { yield Buffer.from("not-json"); };
+  const invalid = await new Promise((resolve) => app.server.emit("request", invalidRequest, responseFor(resolve)));
+  assert.equal(invalid.status, 400);
+  assert.match(JSON.parse(invalid.body).error, /valid JSON/);
+
+  const oversizedRequest = requestFor("POST", "/v1/messages", "x", { "content-length": "2000000" });
+  const oversized = await new Promise((resolve) => app.server.emit("request", oversizedRequest, responseFor(resolve)));
+  assert.equal(oversized.status, 413);
+  assert.match(JSON.parse(oversized.body).error, /exceeds/);
+});
+
 test("a retry wakes the target worker instead of only the requester", async (t) => {
   const app = createServer({ dbPath: ":memory:", token: "" });
   t.after(() => app.close());

@@ -1,6 +1,10 @@
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
-import { supportsCapability } from "./routing.js";
+import {
+  normalizeCapabilities,
+  normalizeMetadata,
+  supportsCapability
+} from "./routing.js";
 
 const now = () => new Date().toISOString();
 
@@ -8,6 +12,7 @@ export class Store {
   constructor(filename = "./data/agent-relay.db") {
     this.db = new DatabaseSync(filename);
     this.db.exec("PRAGMA journal_mode = WAL;");
+    this.db.exec("PRAGMA busy_timeout = 5000;");
     this.db.exec("PRAGMA foreign_keys = ON;");
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS agents (
@@ -58,6 +63,8 @@ export class Store {
         ON messages(recipient, status, created_at);
       CREATE INDEX IF NOT EXISTS jobs_status_created
         ON jobs(status, created_at);
+      CREATE INDEX IF NOT EXISTS jobs_target_status_created
+        ON jobs(target_agent, status, created_at);
       CREATE INDEX IF NOT EXISTS agents_host
         ON agents(host_id, status);
     `);
@@ -84,6 +91,9 @@ export class Store {
 
   registerAgent({ id, hostId, kind = "unknown", capabilities = [], metadata = {} }) {
     const timestamp = now();
+    const normalizedKind = typeof kind === "string" && kind.trim() ? kind : "unknown";
+    const normalizedCapabilities = normalizeCapabilities(capabilities);
+    const normalizedMetadata = normalizeMetadata(metadata);
     this.db.prepare(`
       INSERT INTO agents (id, host_id, kind, capabilities, metadata, status, last_seen, created_at)
       VALUES (?, ?, ?, ?, ?, 'online', ?, ?)
@@ -94,7 +104,7 @@ export class Store {
         metadata = excluded.metadata,
         status = 'online',
         last_seen = excluded.last_seen
-    `).run(id, hostId, kind, JSON.stringify(capabilities), JSON.stringify(metadata), timestamp, timestamp);
+    `).run(id, hostId, normalizedKind, JSON.stringify(normalizedCapabilities), JSON.stringify(normalizedMetadata), timestamp, timestamp);
     return this.getAgent(id);
   }
 
@@ -141,14 +151,40 @@ export class Store {
     ).run(cutoff).changes;
   }
 
+  requeueStaleJobs() {
+    const rows = this.db.prepare(`
+      SELECT jobs.id
+      FROM jobs
+      INNER JOIN agents ON agents.id = jobs.target_agent
+      WHERE jobs.status = 'running' AND agents.status = 'offline'
+      ORDER BY jobs.created_at ASC
+    `).all();
+    const jobs = [];
+    for (const row of rows) {
+      const existing = this.getJob(row.id);
+      if (!existing || existing.status !== "running") continue;
+      const error = "target agent went offline before completing the job";
+      const terminal = existing.attempts >= existing.max_attempts;
+      this.db.prepare(`
+        UPDATE jobs
+        SET status = ?, error = ?, completed_at = ?, started_at = NULL, claimed_by = NULL
+        WHERE id = ? AND status = 'running'
+      `).run(terminal ? "failed" : "queued", error, terminal ? now() : null, row.id);
+      jobs.push(this.getJob(row.id));
+    }
+    return jobs;
+  }
+
   createMessage({ id, conversationId = null, sender, recipient, type = "message", payload }) {
-    const messageId = id ?? randomUUID();
+    const messageId = normalizeId(id, "message");
+    const normalizedType = typeof type === "string" && type.trim() ? type : "message";
     const timestamp = now();
     this.db.prepare(`
       INSERT INTO messages
         (id, conversation_id, sender, recipient, type, payload, status, created_at)
       VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)
-    `).run(messageId, conversationId, sender, recipient, type, JSON.stringify(payload), timestamp);
+      ON CONFLICT(id) DO NOTHING
+    `).run(messageId, conversationId, sender, recipient, normalizedType, JSON.stringify(payload ?? {}), timestamp);
     return this.getMessage(messageId);
   }
 
@@ -226,14 +262,15 @@ export class Store {
   }
 
   createJob({ id, kind, requiredCapability = null, maxAttempts = 3, requestedBy, targetAgent = null, sourceHost = null, targetHost = null, payload = {} }) {
-    const jobId = id ?? randomUUID();
+    const jobId = normalizeId(id, "job");
     const timestamp = now();
     const boundedAttempts = Math.min(Math.max(Number(maxAttempts) || 3, 1), 10);
     this.db.prepare(`
       INSERT INTO jobs
         (id, kind, required_capability, requested_by, target_agent, source_host, target_host, payload, status, attempts, max_attempts, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?)
-    `).run(jobId, kind, requiredCapability, requestedBy, targetAgent, sourceHost, targetHost, JSON.stringify(payload), boundedAttempts, timestamp);
+      ON CONFLICT(id) DO NOTHING
+    `).run(jobId, kind, requiredCapability, requestedBy, targetAgent, sourceHost, targetHost, JSON.stringify(payload ?? {}), boundedAttempts, timestamp);
     return this.getJob(jobId);
   }
 
@@ -276,21 +313,22 @@ export class Store {
     const timestamp = now();
     if (status === "completed") {
       this.db.prepare(`
-        UPDATE jobs SET status = 'completed', result = ?, completed_at = ?
+        UPDATE jobs SET status = 'completed', result = ?, error = NULL, completed_at = ?
         WHERE id = ? AND status = 'running'
       `).run(JSON.stringify(values.result ?? {}), timestamp, id);
     } else {
       const terminal = existing.attempts >= existing.max_attempts;
+      const error = String(values.error ?? "job failed");
       if (terminal) {
         this.db.prepare(`
           UPDATE jobs SET status = 'failed', error = ?, completed_at = ?
           WHERE id = ? AND status = 'running'
-        `).run(String(values.error), timestamp, id);
+        `).run(error, timestamp, id);
       } else {
         this.db.prepare(`
           UPDATE jobs SET status = 'queued', error = ?, completed_at = NULL, started_at = NULL, claimed_by = NULL
           WHERE id = ? AND status = 'running'
-        `).run(String(values.error), id);
+        `).run(error, id);
       }
     }
     return this.getJob(id);
@@ -354,4 +392,11 @@ export class Store {
       claimed_by: row.claimed_by
     };
   }
+}
+
+function normalizeId(value, type) {
+  if (value === undefined || value === null) return randomUUID();
+  const normalized = String(value).trim();
+  if (!normalized) throw new Error(`${type} id must be a non-empty string`);
+  return normalized;
 }

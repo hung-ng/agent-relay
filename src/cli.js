@@ -29,7 +29,20 @@ async function runServer(options) {
   const port = Number(options.port ?? process.env.PORT ?? 8787);
   const host = options.host ?? process.env.HOST ?? "127.0.0.1";
   const app = createServer({ dbPath: options.db ?? process.env.AGENT_RELAY_DB ?? "./data/agent-relay.db", token: options.token ?? process.env.AGENT_RELAY_TOKEN });
-  app.server.listen(port, host, () => console.log(`agent-relay listening on http://${host}:${port}`));
+  await new Promise((resolve, reject) => {
+    const onError = (error) => {
+      app.close();
+      reject(error);
+    };
+    app.server.once("error", onError);
+    app.server.listen(port, host, () => {
+      app.server.off("error", onError);
+      const address = app.server.address();
+      const boundPort = typeof address === "object" && address ? address.port : port;
+      console.log(`agent-relay listening on http://${host}:${boundPort}`);
+      resolve();
+    });
+  });
   const shutdown = () => { app.close(); process.exit(0); };
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
@@ -44,8 +57,19 @@ async function runWorker(options) {
     process.exit(2);
   }
   const kind = options.kind ?? process.env.AGENT_KIND ?? "probe";
-  const capabilities = options.capabilities?.split(",") ?? (kind === "probe" ? ["network.probe"] : ["agent.task"]);
-  const worker = new Worker({ serverUrl: server, agentId, hostId, kind, capabilities, token: options.token ?? process.env.AGENT_RELAY_TOKEN, command: options.command });
+  const capabilities = options.capabilities
+    ? options.capabilities.split(",").map((value) => value.trim()).filter(Boolean)
+    : (kind === "probe" ? ["network.probe"] : ["agent.task"]);
+  const worker = new Worker({
+    serverUrl: server,
+    agentId,
+    hostId,
+    kind,
+    capabilities,
+    token: options.token ?? process.env.AGENT_RELAY_TOKEN,
+    command: options.command,
+    taskTimeoutMs: options.task_timeout_ms ?? process.env.AGENT_RELAY_TASK_TIMEOUT_MS
+  });
   await worker.start();
   console.log(`agent-relay worker ${agentId} connected as ${hostId}`);
   const shutdown = async () => { await worker.stop(); process.exit(0); };
@@ -158,17 +182,23 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function parseArgs(args) {
+export function parseArgs(args) {
   const result = {};
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (!arg.startsWith("--")) continue;
     const [key, inline] = arg.slice(2).split("=", 2);
-    result[key.replaceAll("-", "_")] = inline ?? args[++index] ?? true;
+    if (inline !== undefined) {
+      result[key.replaceAll("-", "_")] = inline;
+    } else if (args[index + 1] && !args[index + 1].startsWith("--")) {
+      result[key.replaceAll("-", "_")] = args[++index];
+    } else {
+      result[key.replaceAll("-", "_")] = true;
+    }
   }
   return result;
 }
 
 function printHelp() {
-  console.log(`agent-relay\n\nCommands:\n  agent-relay server [--host 127.0.0.1] [--port 8787] [--db ./data/agent-relay.db]\n  agent-relay worker --server http://... --agent claude@macbook --host macbook --kind probe\n  agent-relay task --server https://... --target-agent codex@macbook --prompt "..." [--workflow prompt]\n  agent-relay task status --server https://... --job-id ID\n  agent-relay task wait --server https://... --job-id ID [--wait-ms 30000]\n  agent-relay task cancel --server https://... --job-id ID\n\nTask workflows:\n${listWorkflows().map(({ name, description }) => `  ${name.padEnd(10)} ${description}`).join("\n")}\n\nEnvironment:\n  AGENT_RELAY_TOKEN  Require Bearer authentication when set.\n  AGENT_RELAY_URL    Worker server URL.\n  AGENT_ID           Worker agent ID or default requester.\n  HOST_ID            Worker host ID.`);
+  console.log(`agent-relay\n\nCommands:\n  agent-relay server [--host 127.0.0.1] [--port 8787] [--db ./data/agent-relay.db]\n  agent-relay worker --server http://... --agent claude@macbook --host macbook --kind probe [--task-timeout-ms 600000]\n  agent-relay task --server https://... --target-agent codex@macbook --prompt "..." [--workflow prompt]\n  agent-relay task status --server https://... --job-id ID\n  agent-relay task wait --server https://... --job-id ID [--wait-ms 30000]\n  agent-relay task cancel --server https://... --job-id ID\n\nTask workflows:\n${listWorkflows().map(({ name, description }) => `  ${name.padEnd(10)} ${description}`).join("\n")}\n\nEnvironment:\n  AGENT_RELAY_TOKEN  Require Bearer authentication when set.\n  AGENT_RELAY_URL    Worker server URL.\n  AGENT_ID           Worker agent ID or default requester.\n  HOST_ID            Worker host ID.\n  AGENT_RELAY_TASK_TIMEOUT_MS  Maximum worker task runtime.`);
 }

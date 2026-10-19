@@ -1,18 +1,23 @@
 import { spawn } from "node:child_process";
 import { runProbe } from "./probes.js";
 import { requestJson } from "./http.js";
+import { normalizeCapabilities } from "./routing.js";
+
+const MAX_PROCESS_OUTPUT = 128_000;
+const EVENT_CONNECT_TIMEOUT_MS = 30_000;
 
 export class Worker {
-  constructor({ serverUrl, agentId, hostId, kind = "probe", capabilities = ["network.probe"], token = "", command = null, cwd = process.cwd(), allowWrite = false, logger = console }) {
+  constructor({ serverUrl, agentId, hostId, kind = "probe", capabilities = ["network.probe"], token = "", command = null, cwd = process.cwd(), allowWrite = false, taskTimeoutMs = 600_000, logger = console }) {
     this.serverUrl = serverUrl.replace(/\/$/, "");
     this.agentId = agentId;
     this.hostId = hostId;
     this.kind = kind;
-    this.capabilities = capabilities;
+    this.capabilities = normalizeCapabilities(capabilities);
     this.token = token;
     this.command = command;
     this.cwd = cwd;
-    this.allowWrite = allowWrite || capabilities.includes("agent.task.write");
+    this.allowWrite = allowWrite || this.capabilities.includes("agent.task.write");
+    this.taskTimeoutMs = normalizeTaskTimeout(taskTimeoutMs);
     this.logger = logger;
     this.stopped = false;
     this.abortController = new AbortController();
@@ -52,11 +57,17 @@ export class Worker {
   async connectEvents() {
     while (!this.stopped) {
       let response;
+      let connectTimer;
+      let connectController;
       try {
+        connectController = new AbortController();
+        connectTimer = setTimeout(() => connectController.abort(), EVENT_CONNECT_TIMEOUT_MS);
         response = await fetch(`${this.serverUrl}/v1/events?agent_id=${encodeURIComponent(this.agentId)}`, {
           headers: this.headers(),
-          signal: this.abortController.signal
+          signal: AbortSignal.any([this.abortController.signal, connectController.signal])
         });
+        clearTimeout(connectTimer);
+        connectTimer = null;
         if (!response.ok || !response.body) throw new Error(`event stream failed: ${response.status}`);
         this.reconnectDelayMs = 1000;
         await this.replayPending();
@@ -69,6 +80,7 @@ export class Worker {
           this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, 30_000);
         }
       } finally {
+        if (connectTimer) clearTimeout(connectTimer);
         try {
           await response?.body?.cancel?.();
         } catch {
@@ -110,6 +122,7 @@ export class Worker {
       const delivery = await this.request(`/v1/messages/${encodeURIComponent(message.id)}/deliver`, { method: "POST" });
       if (delivery.message?.status === "acknowledged") return;
       const body = message.payload?.body ?? JSON.stringify(message.payload);
+      const replyId = `reply:${message.id}`;
       this.logger.log(`[${this.agentId}] message from ${message.sender}: ${body}`);
       if ((this.kind === "claude" || this.kind === "codex") && ["message", "request", "task"].includes(message.type)) {
         try {
@@ -117,6 +130,7 @@ export class Worker {
           await this.request("/v1/messages", {
             method: "POST",
             body: {
+              id: replyId,
               sender: this.agentId,
               recipient: message.sender,
               type: "reply",
@@ -128,6 +142,7 @@ export class Worker {
           await this.request("/v1/messages", {
             method: "POST",
             body: {
+              id: replyId,
               sender: this.agentId,
               recipient: message.sender,
               type: "reply",
@@ -180,7 +195,11 @@ export class Worker {
     }
     const command = this.command ?? this.kind;
     const args = agentTaskArgs(command, { ...payload, allow_write: this.allowWrite });
-    return runProcess(command, args, { cwd: payload.cwd ?? this.cwd });
+    return runProcess(command, args, {
+      cwd: payload.cwd ?? this.cwd,
+      timeoutMs: normalizeTaskTimeout(payload.task_timeout_ms ?? this.taskTimeoutMs),
+      signal: this.abortController.signal
+    });
   }
 
   async request(path, { method = "GET", body } = {}) {
@@ -223,19 +242,66 @@ function parseEvent(raw) {
   return { event, data: JSON.parse(data) };
 }
 
-function runProcess(command, args, options) {
+export function runProcess(command, args, { timeoutMs, signal, ...spawnOptions }) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { ...options, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(command, args, { ...spawnOptions, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
-    child.stdout.on("data", (chunk) => { stdout += chunk; });
-    child.stderr.on("data", (chunk) => { stderr += chunk; });
-    child.on("error", reject);
+    let timedOut = false;
+    let stopping = false;
+    let killTimer;
+    const normalizedTimeoutMs = Number(timeoutMs);
+    const stopChild = () => {
+      if (stopping) return;
+      stopping = true;
+      child.kill("SIGTERM");
+      killTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+    };
+    const timeout = Number.isFinite(normalizedTimeoutMs) && normalizedTimeoutMs > 0
+      ? setTimeout(() => {
+        timedOut = true;
+        stopChild();
+      }, normalizedTimeoutMs)
+      : null;
+    if (signal) {
+      if (signal.aborted) stopChild();
+      else signal.addEventListener("abort", stopChild, { once: true });
+    }
+    const cleanup = () => {
+      if (timeout) clearTimeout(timeout);
+      if (killTimer) clearTimeout(killTimer);
+      signal?.removeEventListener("abort", stopChild);
+    };
+    child.stdout.on("data", (chunk) => { stdout = appendOutput(stdout, chunk); });
+    child.stderr.on("data", (chunk) => { stderr = appendOutput(stderr, chunk); });
+    child.on("error", (error) => {
+      cleanup();
+      reject(error);
+    });
     child.on("close", (code, signal) => {
-      if (code === 0) resolve({ command, args, code, signal, stdout: stdout.slice(0, 128_000), stderr: stderr.slice(0, 128_000) });
-      else reject(new Error(`${command} exited with code ${code ?? "unknown"}${signal ? ` (${signal})` : ""}: ${stderr || stdout}`));
+      cleanup();
+      if (timedOut) {
+        reject(new Error(`${command} timed out after ${normalizedTimeoutMs}ms`));
+      } else if (stopping) {
+        reject(new Error(`${command} was aborted`));
+      } else if (code === 0) {
+        resolve({ command, args, code, signal, stdout, stderr });
+      } else {
+        reject(new Error(`${command} exited with code ${code ?? "unknown"}${signal ? ` (${signal})` : ""}: ${stderr || stdout}`));
+      }
     });
   });
+}
+
+function appendOutput(current, chunk) {
+  if (current.length >= MAX_PROCESS_OUTPUT) return current;
+  return current + String(chunk).slice(0, MAX_PROCESS_OUTPUT - current.length);
+}
+
+function normalizeTaskTimeout(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 600_000;
+  return Math.min(Math.floor(parsed), 86_400_000);
 }
 
 function delay(ms) {

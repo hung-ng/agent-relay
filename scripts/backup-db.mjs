@@ -2,7 +2,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
-import { mkdir, readdir, rename, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
 
 export async function backupDatabase({
   dbPath = process.env.AGENT_RELAY_DB ?? path.resolve("data/agent-relay.db"),
@@ -15,12 +15,7 @@ export async function backupDatabase({
   await mkdir(backupDir, { recursive: true, mode: 0o700 });
 
   const lockPath = path.join(backupDir, ".backup.lock");
-  try {
-    await writeFile(lockPath, `${process.pid}\n`, { flag: "wx", mode: 0o600 });
-  } catch (error) {
-    if (error.code === "EEXIST") throw new Error("a database backup is already running");
-    throw error;
-  }
+  await acquireLock(lockPath);
 
   const stamp = clock().toISOString().replace(/[-:]/g, "").replace(".", "");
   const backupPath = path.join(backupDir, `agent-relay-${stamp}.db`);
@@ -29,6 +24,7 @@ export async function backupDatabase({
   try {
     await unlink(partialPath).catch(() => {});
     source = new DatabaseSync(dbPath);
+    source.exec("PRAGMA busy_timeout = 5000;");
     source.exec(`VACUUM INTO '${escapeSqlString(partialPath)}'`);
     source.close();
     source = null;
@@ -43,6 +39,37 @@ export async function backupDatabase({
     source?.close();
     await unlink(partialPath).catch(() => {});
     await unlink(lockPath).catch(() => {});
+  }
+}
+
+async function acquireLock(lockPath) {
+  try {
+    await writeFile(lockPath, `${process.pid}\n`, { flag: "wx", mode: 0o600 });
+    return;
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+  }
+
+  const owner = await readFile(lockPath, "utf8").catch(() => "");
+  const pid = Number(owner.trim());
+  if (Number.isInteger(pid) && pid > 0 && isProcessAlive(pid)) {
+    throw new Error("a database backup is already running");
+  }
+  await unlink(lockPath).catch(() => {});
+  try {
+    await writeFile(lockPath, `${process.pid}\n`, { flag: "wx", mode: 0o600 });
+  } catch (error) {
+    if (error.code === "EEXIST") throw new Error("a database backup is already running");
+    throw error;
+  }
+}
+
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
   }
 }
 

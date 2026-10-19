@@ -30,3 +30,37 @@ test("persists messages and job lifecycle", () => {
   assert.deepEqual(store.getJob(job.id).result, { ok: true });
   store.close();
 });
+
+test("reuses caller supplied IDs for safe retries", () => {
+  const store = new Store(":memory:");
+  const message = store.createMessage({
+    id: "message-retry",
+    sender: "claude@book",
+    recipient: "codex@mini",
+    payload: { body: "hello" }
+  });
+  const repeatedMessage = store.createMessage({
+    id: "message-retry",
+    sender: "different-sender",
+    recipient: "different-recipient",
+    payload: { body: "different" }
+  });
+  assert.deepEqual(repeatedMessage, message);
+
+  const job = store.createJob({
+    id: "job-retry",
+    kind: "agent.task",
+    requestedBy: "service-monitor",
+    targetAgent: "codex@mini",
+    payload: { prompt: "inspect" }
+  });
+  const repeatedJob = store.createJob({
+    id: "job-retry",
+    kind: "network.probe",
+    requestedBy: "different-requester",
+    targetAgent: "probe@mini",
+    payload: { checks: [] }
+  });
+  assert.deepEqual(repeatedJob, job);
+  store.close();
+});

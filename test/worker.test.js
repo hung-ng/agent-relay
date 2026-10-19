@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { Worker, agentTaskArgs } from "../src/worker.js";
+import { Worker, agentTaskArgs, runProcess } from "../src/worker.js";
 
 test("read-only Codex tasks use the installed noninteractive policy", () => {
   assert.deepEqual(agentTaskArgs("codex", { execution_mode: "read_only", prompt: "inspect" }), [
@@ -20,6 +20,20 @@ test("read-only Codex tasks use the installed noninteractive policy", () => {
     'approval_policy="never"',
     "implement"
   ]);
+});
+
+test("worker subprocesses are terminated when they exceed their timeout", async () => {
+  await assert.rejects(
+    runProcess(process.execPath, ["-e", "setTimeout(() => {}, 1000)"], { timeoutMs: 20 }),
+    /timed out after 20ms/
+  );
+});
+
+test("worker subprocesses stop when the worker is aborted", async () => {
+  const controller = new AbortController();
+  const running = runProcess(process.execPath, ["-e", "setTimeout(() => {}, 1000)"], { signal: controller.signal });
+  setTimeout(() => controller.abort(), 20);
+  await assert.rejects(running, /was aborted/);
 });
 
 test("agent workers turn requests into replies", async () => {
@@ -53,6 +67,7 @@ test("agent workers turn requests into replies", async () => {
   ]);
   assert.equal(calls[1].options.body.recipient, "codex@mini");
   assert.equal(calls[1].options.body.type, "reply");
+  assert.equal(calls[1].options.body.id, "reply:message-1");
   assert.equal(calls[1].options.body.payload.body, "answer: check the service");
 });
 

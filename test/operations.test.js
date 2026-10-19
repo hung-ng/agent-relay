@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Store } from "../src/store.js";
@@ -23,6 +23,20 @@ test("backs up SQLite data, checks integrity, and prunes old backups", async () 
   assert.equal(second.integrity, "ok");
   assert.deepEqual(files.filter((name) => name.endsWith(".db")).length, 1);
   assert.ok((await stat(second.path)).size > 0);
+  await rm(root, { recursive: true, force: true });
+});
+
+test("recovers a backup lock left by a dead process", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "agent-relay-backup-lock-"));
+  const dbPath = path.join(root, "agent-relay.db");
+  const backupDir = path.join(root, "backups");
+  const store = new Store(dbPath);
+  store.close();
+  await mkdir(backupDir, { recursive: true });
+  await writeFile(path.join(backupDir, ".backup.lock"), "99999999\n");
+
+  const result = await backupDatabase({ dbPath, backupDir, retention: 1, clock: () => new Date("2026-10-17T12:00:00.000Z") });
+  assert.equal(result.integrity, "ok");
   await rm(root, { recursive: true, force: true });
 });
 
@@ -87,5 +101,40 @@ test("failed jobs retry up to max attempts, then become failed", () => {
   assert.equal(failed.attempts, 2);
   assert.equal(failed.max_attempts, 2);
   assert.equal(failed.error, "second failure");
+  store.close();
+});
+
+test("requeues a running job when its worker goes offline", () => {
+  const store = new Store(":memory:");
+  store.registerAgent({ id: "probe@test", hostId: "test", capabilities: ["network.probe"] });
+  const job = store.createJob({
+    kind: "network.probe",
+    requiredCapability: "network.probe",
+    requestedBy: "service-monitor",
+    targetAgent: "probe@test",
+    payload: { checks: [] }
+  });
+  store.claimJob(job.id, "probe@test");
+  store.db.prepare("UPDATE agents SET last_seen = ? WHERE id = ?").run("2000-01-01T00:00:00.000Z", "probe@test");
+  store.markStale();
+
+  const [requeued] = store.requeueStaleJobs();
+  assert.equal(requeued.status, "queued");
+  assert.equal(requeued.claimed_by, null);
+  assert.match(requeued.error, /went offline/);
+
+  const terminalJob = store.createJob({
+    kind: "network.probe",
+    requiredCapability: "network.probe",
+    maxAttempts: 1,
+    requestedBy: "service-monitor",
+    targetAgent: "probe@test",
+    payload: { checks: [] }
+  });
+  store.claimJob(terminalJob.id, "probe@test");
+  const [failed] = store.requeueStaleJobs();
+  assert.equal(failed.status, "failed");
+  assert.ok(failed.completed_at);
+  assert.equal(failed.claimed_by, null);
   store.close();
 });
