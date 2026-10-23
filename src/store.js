@@ -193,8 +193,8 @@ export class Store {
       `).run(terminal ? "failed" : "queued", error, terminal ? now() : null, row.store_rowid, existing.claim_token, existing.attempts);
       if (result.changes > 0) {
         const updated = this.db.prepare("SELECT *, CAST(id AS BLOB) AS store_id_bytes FROM jobs WHERE rowid = ?").get(row.store_rowid);
-        // A lossy ID could notify a different job. Recover the row without publishing it.
-        if (updated && Buffer.from(updated.id).equals(updated.store_id_bytes)) jobs.push(this.#job(updated));
+        // NUL or lossy IDs are unsafe across Node versions. Recover without publishing them.
+        if (updated && !updated.store_id_bytes.includes(0) && Buffer.from(updated.id).equals(updated.store_id_bytes)) jobs.push(this.#job(updated));
       }
     }
     return jobs;
