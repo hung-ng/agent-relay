@@ -132,11 +132,11 @@ export class Store {
     return this.db.prepare("SELECT * FROM agents ORDER BY id").all().map((row) => this.#agent(row));
   }
 
-  findAgentForHost(hostId, capability) {
+  findAgentForHost(hostId, capability, { kind = null } = {}) {
     this.markStale();
     const rows = this.db.prepare(
-      "SELECT * FROM agents WHERE host_id = ? AND status = 'online' ORDER BY last_seen DESC"
-    ).all(hostId);
+      "SELECT * FROM agents WHERE host_id = ? AND status = 'online' AND (? IS NULL OR kind = ?) ORDER BY last_seen DESC"
+    ).all(hostId, kind, kind);
     const match = rows.find((row) => {
       const capabilities = JSON.parse(row.capabilities);
       return supportsCapability(capabilities, capability);

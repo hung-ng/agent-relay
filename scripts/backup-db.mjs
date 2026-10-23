@@ -2,7 +2,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
-import { chmod, mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 
 export async function backupDatabase({
   dbPath = process.env.AGENT_RELAY_DB ?? path.resolve("data/agent-relay.db"),
@@ -14,18 +14,22 @@ export async function backupDatabase({
   const keep = Math.max(1, Number.isFinite(retention) ? Math.floor(retention) : 7);
   const stamp = clock().toISOString().replace(/[-:]/g, "").replace(".", "");
   await mkdir(backupDir, { recursive: true, mode: 0o700 });
-  const lockPath = path.join(backupDir, ".backup.lock");
   const backupPath = path.join(backupDir, `agent-relay-${stamp}.db`);
   const partialPath = `${backupPath}.partial`;
   let source = new DatabaseSync(dbPath, { readOnly: true });
   let release;
-  let ownsLegacyLock = false;
+  let ownsPartial = false;
   try {
     release = await acquireMutex(path.join(backupDir, ".backup-lock.sqlite"));
-    await acquireLock(lockPath);
-    ownsLegacyLock = true;
-    await unlink(partialPath).catch(() => {});
+    const sourceIdentity = await stat(dbPath, { bigint: true });
+    const destination = await stat(backupPath, { bigint: true }).catch((error) => {
+      if (error.code !== "ENOENT") throw error;
+      return null;
+    });
+    if (destination && sameFile(destination, sourceIdentity)) throw new Error("backup destination must differ from the source database");
+    await cleanPartialBackups(backupDir, sourceIdentity);
     await writeFile(partialPath, "", { flag: "wx", mode: 0o600 });
+    ownsPartial = true;
     source.exec("PRAGMA busy_timeout = 5000;");
     source.exec(`VACUUM INTO '${escapeSqlString(partialPath)}'`);
     source.close();
@@ -36,16 +40,16 @@ export async function backupDatabase({
     await chmod(partialPath, 0o600);
     await rename(partialPath, backupPath);
 
-    const removed = await pruneBackups(backupDir, keep);
+    const removed = await pruneBackups(backupDir, keep, path.basename(backupPath), sourceIdentity);
     return { path: backupPath, integrity, removed, retained: keep };
   } finally {
-    source?.close();
     try {
-      if (ownsLegacyLock) {
-        await unlink(partialPath).catch(() => {});
-        await unlink(lockPath).catch(() => {});
-      }
-    } finally { release?.(); }
+      source?.close();
+    } finally {
+      try {
+        if (ownsPartial) await unlink(partialPath).catch(() => {});
+      } finally { release?.(); }
+    }
   }
 }
 
@@ -65,34 +69,16 @@ async function acquireMutex(filename) {
   };
 }
 
-async function acquireLock(lockPath) {
-  try {
-    await writeFile(lockPath, `${process.pid}\n`, { flag: "wx", mode: 0o600 });
-    return;
-  } catch (error) {
-    if (error.code !== "EEXIST") throw error;
-  }
-
-  const owner = await readFile(lockPath, "utf8").catch(() => "");
-  const pid = Number(owner.trim());
-  if (Number.isInteger(pid) && pid > 0 && isProcessAlive(pid)) {
-    throw new Error("a database backup is already running");
-  }
-  await unlink(lockPath).catch(() => {});
-  try {
-    await writeFile(lockPath, `${process.pid}\n`, { flag: "wx", mode: 0o600 });
-  } catch (error) {
-    if (error.code === "EEXIST") throw new Error("a database backup is already running");
-    throw error;
-  }
+function sameFile(left, right) {
+  return left.dev === right.dev && left.ino === right.ino;
 }
 
-function isProcessAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error.code === "EPERM";
+async function cleanPartialBackups(backupDir, sourceIdentity) {
+  for (const entry of await readdir(backupDir, { withFileTypes: true })) {
+    if (!entry.isFile() || !/^agent-relay-\d{8}T\d{9}Z\.db\.partial$/.test(entry.name)) continue;
+    const filename = path.join(backupDir, entry.name);
+    const candidate = await stat(filename, { bigint: true });
+    if (!sameFile(candidate, sourceIdentity)) await unlink(filename);
   }
 }
 
@@ -106,11 +92,15 @@ function verifyIntegrity(filename) {
   }
 }
 
-async function pruneBackups(backupDir, retention) {
-  const names = (await readdir(backupDir))
-    .filter((name) => /^agent-relay-[0-9TZ]+\.db$/.test(name))
-    .sort()
-    .reverse();
+async function pruneBackups(backupDir, retention, currentBackup, sourceIdentity) {
+  const names = [];
+  for (const entry of await readdir(backupDir, { withFileTypes: true })) {
+    if (!entry.isFile() || !/^agent-relay-[0-9TZ]+\.db$/.test(entry.name) || entry.name === currentBackup) continue;
+    const candidate = await stat(path.join(backupDir, entry.name), { bigint: true });
+    if (!sameFile(candidate, sourceIdentity)) names.push(entry.name);
+  }
+  names.sort().reverse();
+  names.unshift(currentBackup);
   const removed = [];
   for (const name of names.slice(0, retention)) await chmod(path.join(backupDir, name), 0o600);
   for (const name of names.slice(retention)) {

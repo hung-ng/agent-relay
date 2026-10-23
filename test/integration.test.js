@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { setTimeout as delay } from "node:timers/promises";
+import { request as httpRequest } from "node:http";
 import { createServer } from "../src/server.js";
 import { Worker, runProcess } from "../src/worker.js";
 import { requestJson } from "../src/http.js";
@@ -43,6 +44,37 @@ async function waitUntil(predicate, timeoutMs = 5000) {
     await delay(10);
   }
 }
+
+test("HTTP and MCP reject invalid UTF-8 before persisting messages", { timeout: 10_000 }, async (t) => {
+  const { app, serverUrl, request } = await startRelay(t, { worker: false });
+  const envelopes = [
+    ["/v1/messages", '{"sender":"operator","recipient":"worker","payload":{"body":"', '"}}'],
+    ["/mcp", '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_message","arguments":{"sender":"operator","recipient":"worker","body":"', '"}}}']
+  ];
+  for (const [route, prefix, suffix] of envelopes) {
+    const bytes = Buffer.concat([Buffer.from(prefix), Buffer.from([0xff]), Buffer.from(suffix)]);
+    const response = await new Promise((resolve, reject) => {
+      const outgoing = httpRequest(new URL(route, serverUrl), {
+        method: "POST",
+        headers: { authorization: "Bearer integration-token", "content-type": "application/json", "content-length": bytes.length }
+      }, (incoming) => {
+        incoming.resume();
+        incoming.on("end", () => resolve({ status: incoming.statusCode }));
+        incoming.on("error", reject);
+      });
+      outgoing.setTimeout(5000, () => outgoing.destroy(new Error("request stalled")));
+      outgoing.on("error", reject);
+      outgoing.end(bytes);
+    });
+    assert.equal(response.status, 400, route);
+    assert.equal(app.store.db.prepare("SELECT count(*) AS count FROM messages").get().count, 0);
+  }
+  const body = "€😀�";
+  const { message } = await request("/v1/messages", {
+    method: "POST", body: { sender: "operator", recipient: "worker", payload: { body } }
+  });
+  assert.equal(message.payload.body, body);
+});
 
 test("old workers keep executing while the operator uses the new rotation credential", { timeout: 10_000 }, async (t) => {
   const { app, worker, dispatch, errors } = await startRelay(t, {

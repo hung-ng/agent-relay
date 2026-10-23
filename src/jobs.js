@@ -43,10 +43,11 @@ export function dispatchJob({ store, publish }, input) {
   }
 
   const requiredCapability = requiredCapabilityForJob({ kind: input.kind, capability: input.capability, payload });
-  const targetAgent = input.target_agent ?? (input.source_host ? store.findAgentForHost(input.source_host, requiredCapability)?.id : null);
+  const requiresCodex = Boolean(payload.workflow) || ["read_only", "write"].includes(payload.execution_mode);
+  const targetAgent = input.target_agent ?? (input.source_host ? store.findAgentForHost(input.source_host, requiredCapability, { kind: requiresCodex ? "codex" : null })?.id : null);
   if (!targetAgent) throw requestError("no target agent is registered", 409);
   if (!store.agentSupports(targetAgent, requiredCapability)) throw requestError("target agent does not provide the required capability", 409);
-  if ((payload.workflow || ["read_only", "write"].includes(payload.execution_mode)) && store.getAgent(targetAgent)?.kind !== "codex") {
+  if (requiresCodex && store.getAgent(targetAgent)?.kind !== "codex") {
     throw requestError("workflow tasks require a codex agent", 409);
   }
   const job = store.createJob({

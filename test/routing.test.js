@@ -126,6 +126,36 @@ test("dispatch selects an agent with the requested capability", async (t) => {
   assert.equal(bypassedWriteWorkflow.response.status, 409);
 });
 
+test("host dispatch chooses a compatible Codex worker before rejecting a workflow", async (t) => {
+  const app = createServer({ dbPath: ":memory:", token: "" });
+  t.after(() => app.close());
+  app.store.registerAgent({ id: "codex", hostId: "shared", kind: "codex", capabilities: ["agent.task", "agent.task.write"] });
+  app.store.registerAgent({ id: "claude", hostId: "shared", kind: "claude", capabilities: ["agent.task", "agent.task.write"] });
+  app.store.db.prepare("UPDATE agents SET last_seen = ? WHERE id = ?").run(new Date(Date.now() - 1000).toISOString(), "codex");
+
+  for (const payload of [{ workflow: "review" }, { execution_mode: "read_only" }, { execution_mode: "write" }]) {
+    const { response, value } = await jsonRequest(app, "POST", "/v1/jobs", {
+      kind: "agent.task", requested_by: "operator", source_host: "shared", payload: { prompt: "work", ...payload }
+    });
+    assert.equal(response.status, 201, JSON.stringify(value));
+    assert.equal(value.job.target_agent, "codex");
+  }
+
+  const ordinary = await jsonRequest(app, "POST", "/v1/jobs", {
+    kind: "agent.task", requested_by: "operator", source_host: "shared", payload: { prompt: "plain task" }
+  });
+  assert.equal(ordinary.value.job.target_agent, "claude");
+  const explicit = await jsonRequest(app, "POST", "/v1/jobs", {
+    kind: "agent.task", requested_by: "operator", target_agent: "claude", payload: { prompt: "work", workflow: "review" }
+  });
+  assert.equal(explicit.response.status, 409);
+  app.store.db.prepare("UPDATE agents SET status = 'offline' WHERE id = ?").run("codex");
+  const unavailable = await jsonRequest(app, "POST", "/v1/jobs", {
+    kind: "agent.task", requested_by: "operator", source_host: "shared", payload: { prompt: "work", workflow: "review" }
+  });
+  assert.equal(unavailable.response.status, 409);
+});
+
 test("readiness reports the relay is available", async (t) => {
   const app = createServer({ dbPath: ":memory:", token: "" });
   t.after(() => app.close());

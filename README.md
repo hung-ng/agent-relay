@@ -14,6 +14,8 @@ npm start -- --host 127.0.0.1 --port 8787
 
 Set `AGENT_RELAY_TOKEN` before allowing network access. Keep remote workers behind Tailscale or another private HTTPS network. The relay assumes trusted workers under one operator.
 
+JSON request bodies are limited to 1 MiB and require valid UTF-8. The HTTP and MCP endpoints reject malformed encoding with HTTP 400 before storing messages or jobs.
+
 For a coordinated credential change, the coordinator can temporarily accept the old credential through `AGENT_RELAY_PREVIOUS_TOKEN` while `AGENT_RELAY_TOKEN` holds the new one. A previous token requires a nonempty primary token. After every worker and client has switched, remove the previous token and restart the coordinator to revoke it. Both credentials grant the same access during the overlap.
 
 ## Run workers
@@ -130,6 +132,8 @@ The initial workflows are:
 
 Use `--source-host` instead of `--target-agent` when the relay should select an online worker for a host. Use `--wait-ms 0` to submit without polling, or `--cwd` to select the repository directory on the worker. The workflow name remains in the job payload so later policy and audit rules can distinguish read-only reviews from implementation work.
 
+Host-based workflow requests select an online Codex worker with the required capability.
+
 Pass `--id YOUR_STABLE_ID` when submitting a task that you may need to retry after a timeout. The same ID returns the original job, including when its worker has since gone offline. Workflow execution modes must match their workflow, and implementation work always requires `agent.task.write`.
 
 The CLI also supports durable follow-up actions:
@@ -240,6 +244,8 @@ Before using a remote worker, choose the server bind address, private URL, port,
 The server can also run a daily SQLite backup and a minute-by-minute monitor. Render `backup.plist.template` and `monitor.plist.template` with the same `AGENT_RELAY_ROOT`, `AGENT_RELAY_DATA`, and `AGENT_RELAY_LOG_DIR` values. Set `AGENT_RELAY_BACKUP_RETENTION` to the number of daily copies to keep. The monitor checks `/healthz`, `/readyz`, and the expected online worker capability, then records its last result in `data/monitor-state.json`.
 
 The monitor checks all three endpoints concurrently with a ten-second request timeout and requires successful health and readiness payloads. It replaces its state file atomically. A SQLite lock prevents overlapping backups and releases automatically if the backup process exits or crashes.
+
+Backup recovery removes abandoned snapshot partials under the SQLite lock. Retention always keeps the snapshot just verified, including when the system clock moves backward. Cleanup and retention preserve the source database through symlinks and hard links. A backup destination that points to the source is rejected. Only backup scripts using the SQLite lock participate in writer exclusion; older PID-file-only scripts do not coordinate with current writers.
 
 Load these jobs after rendering them:
 

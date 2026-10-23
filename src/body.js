@@ -13,7 +13,12 @@ export async function readJsonBody(request, { maxBytes = MAX_JSON_BYTES } = {}) 
     if (size > maxBytes) throw bodyError(`request body exceeds ${maxBytes} bytes`, 413);
     chunks.push(chunk);
   }
-  const text = Buffer.concat(chunks).toString("utf8");
+  let text;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(Buffer.concat(chunks));
+  } catch {
+    throw bodyError("request body must contain valid UTF-8", 400);
+  }
   if (!text) return {};
   let value;
   try {
