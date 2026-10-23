@@ -1,3 +1,5 @@
+import { validateIdentifier } from "./identifiers.js";
+
 export function normalizeJobPayload({ kind, payload, sourceHost = null, targetHost = null }) {
   const normalizedPayload = isRecord(payload) ? { ...payload } : {};
   if (kind !== "network.probe") return normalizedPayload;
@@ -16,14 +18,18 @@ export function supportsCapability(capabilities, capability) {
 }
 
 export function requiredCapabilityForJob({ kind, capability, payload }) {
+  const normalizedCapability = capability === null || capability === undefined ? "" : normalizeCapability(capability);
   if (kind === "agent.task" && payload?.execution_mode === "write") return "agent.task.write";
-  const normalizedCapability = capability === null || capability === undefined ? "" : String(capability).trim();
-  return normalizedCapability || kind;
+  return normalizedCapability || validateIdentifier(kind, "kind");
 }
 
 export function normalizeCapabilities(capabilities) {
   if (!Array.isArray(capabilities)) return [];
-  return [...new Set(capabilities.map((value) => String(value).trim()).filter(Boolean))];
+  return [...new Set(capabilities.map(normalizeCapability).filter(Boolean))];
+}
+
+function normalizeCapability(value) {
+  return validateIdentifier(String(value).trim(), "capability");
 }
 
 export function normalizeMetadata(metadata) {

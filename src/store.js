@@ -108,6 +108,7 @@ export class Store {
     validateIdentifier(hostId, "host_id");
     const timestamp = now();
     const normalizedKind = typeof kind === "string" && kind.trim() ? kind : "unknown";
+    validateIdentifier(normalizedKind, "kind");
     const normalizedCapabilities = normalizeCapabilities(capabilities);
     const normalizedMetadata = normalizeMetadata(metadata);
     this.db.prepare(`
@@ -205,6 +206,7 @@ export class Store {
     const existing = this.getMessage(messageId);
     if (existing) return existing;
     const normalizedType = typeof type === "string" && type.trim() ? type : "message";
+    validateIdentifier(normalizedType, "message type");
     validateRecordId(messageId, "message id", normalizedType === "reply" ? MAX_ENCODED_REPLY_ID_LENGTH : MAX_ENCODED_ID_LENGTH);
     validateAgentId(sender, "sender");
     validateAgentId(recipient, "recipient");
@@ -302,6 +304,8 @@ export class Store {
     const jobId = normalizeRecordId(id, "job id");
     const existing = this.getJob(jobId);
     if (existing) return existing;
+    validateIdentifier(kind, "kind");
+    if (requiredCapability !== null) validateIdentifier(requiredCapability, "capability");
     validateAgentId(requestedBy, "requested_by");
     if (targetAgent !== null) validateAgentId(targetAgent, "target_agent");
     if (sourceHost !== null) validateIdentifier(sourceHost, "source_host");

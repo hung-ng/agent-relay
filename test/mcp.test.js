@@ -4,9 +4,13 @@ import { Store } from "../src/store.js";
 import { createMcpHandler } from "../src/mcp.js";
 
 function requestFor(body, headers = {}) {
+  return requestForJson(JSON.stringify(body), headers);
+}
+
+function requestForJson(text, headers = {}) {
   return {
     headers,
-    async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify(body)); }
+    async *[Symbol.asyncIterator]() { yield Buffer.from(text); }
   };
 }
 
@@ -145,4 +149,69 @@ test("MCP returns an execution error when a valid dispatch has no target", async
   const value = JSON.parse(response.body);
   assert.equal(value.result.isError, true);
   assert.match(value.result.content[0].text, /capability/);
+});
+
+test("MCP rejects deep metadata before persistence and counts its request envelope", async (t) => {
+  const store = new Store(":memory:");
+  t.after(() => store.close());
+  const original = store.registerAgent({ id: "existing", hostId: "original", metadata: { keep: true } });
+  const register = t.mock.method(store, "registerAgent");
+  const published = [];
+  const handler = createMcpHandler({ store, publish: (...args) => published.push(args) });
+  const registration = (id, depth) => '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"register_agent","arguments":{"agent_id":'
+    + JSON.stringify(id) + ',"host_id":"changed","metadata":' + '{"n":'.repeat(depth) + "null" + "}".repeat(depth) + "}}}";
+
+  for (const metadataDepth of [126, 5845]) {
+    const response = responseFor();
+    await handler(requestForJson(registration("existing", metadataDepth)), response);
+    assert.equal(response.status, 400);
+    assert.deepEqual(JSON.parse(response.body), {
+      jsonrpc: "2.0", id: null,
+      error: { code: -32700, message: "request body exceeds 128 levels of nesting" }
+    });
+    assert.equal(register.mock.callCount(), 0);
+    assert.deepEqual(store.getAgent("existing"), original);
+    assert.deepEqual(published, []);
+  }
+  const response = responseFor();
+  await handler(requestForJson(registration("boundary", 125)), response);
+  assert.equal(response.status, 200);
+  const result = JSON.parse(response.body).result;
+  assert.equal(result.structuredContent.id, "boundary");
+  assert.equal(result.content[0].text, JSON.stringify(result.structuredContent));
+  assert.deepEqual(store.getAgent("boundary"), result.structuredContent);
+  assert.equal(register.mock.callCount(), 1);
+  assert.equal(store.db.prepare("SELECT count(*) AS count FROM agents").get().count, 2);
+});
+
+test("MCP text stays compact as stored result depth grows and preserves result shapes", async () => {
+  const sizes = new Map();
+  for (const depth of [128, 256, 1024]) {
+    const metadata = JSON.parse('{"n":'.repeat(depth) + '"line 1\\nline 2 😀"' + "}".repeat(depth));
+    const record = { id: "stored", metadata };
+    const store = { getJob: () => record, listAgents: () => [record] };
+    const handler = createMcpHandler({ store, publish() {} });
+    for (const [name, args, expected] of [
+      ["get_job", { job_id: "stored" }, record], ["list_agents", {}, [record]]
+    ]) {
+      const response = responseFor();
+      await handler(requestFor({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }), response);
+      assert.equal(response.status, 200);
+      const result = JSON.parse(response.body).result;
+      const compact = JSON.stringify(expected);
+      const text = result.content[0].text;
+      assert.equal(result.isError, undefined);
+      assert.equal(result.content[0].type, "text");
+      assert.equal(text.length, compact.length);
+      assert.equal(text, compact);
+      assert.equal(JSON.stringify(JSON.parse(text)), compact);
+      assert.equal(Object.hasOwn(result, "structuredContent"), name === "get_job");
+      if (name === "get_job") assert.equal(JSON.stringify(result.structuredContent), compact);
+      sizes.set(`${name}:${depth}`, text.length);
+    }
+  }
+  for (const name of ["get_job", "list_agents"]) {
+    assert.ok(sizes.get(`${name}:256`) <= 2 * sizes.get(`${name}:128`));
+    assert.ok(sizes.get(`${name}:1024`) <= 4 * sizes.get(`${name}:256`));
+  }
 });

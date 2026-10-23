@@ -45,6 +45,41 @@ async function waitUntil(predicate, timeoutMs = 5000) {
   }
 }
 
+test("HTTP and MCP bound nesting before writes and return compact boundary records", { timeout: 10_000 }, async (t) => {
+  const { app, serverUrl, request } = await startRelay(t, { worker: false });
+  const nested = depth => '{"n":'.repeat(depth) + "null" + "}".repeat(depth);
+  for (const [route, boundary, envelope] of [
+    ["/v1/agents/register", 127, metadata => '{"id":"http","host_id":"host","metadata":' + metadata + "}"],
+    ["/mcp", 125, metadata => '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"register_agent","arguments":{"agent_id":"mcp","host_id":"host","metadata":' + metadata + "}}}"]
+  ]) {
+    const before = app.store.listAgents().length;
+    for (const depth of [boundary + 1, 5845]) {
+      const response = await fetch(serverUrl + route, {
+        method: "POST", headers: { authorization: "Bearer integration-token", "content-type": "application/json" },
+        body: envelope(nested(depth))
+      });
+      assert.equal(response.status, 400);
+      assert.match(await response.text(), /128 levels of nesting/);
+      assert.equal(app.store.listAgents().length, before);
+    }
+    const accepted = await fetch(serverUrl + route, {
+      method: "POST", headers: { authorization: "Bearer integration-token", "content-type": "application/json" },
+      body: envelope(nested(boundary))
+    });
+    assert.equal(accepted.status, 200);
+    await accepted.arrayBuffer();
+    assert.equal(app.store.listAgents().length, before + 1);
+  }
+  const { agents } = await request("/v1/agents");
+  assert.equal(agents.length, 2);
+  const listed = await request("/mcp", { method: "POST", body: {
+    jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "list_agents", arguments: {} }
+  } });
+  assert.deepEqual(JSON.parse(listed.result.content[0].text), agents);
+  assert.ok(Buffer.byteLength(JSON.stringify(listed)) < 16_384);
+  assert.equal((await request("/readyz")).ok, true);
+});
+
 test("MCP declines unsupported stream and session methods without reporting a missing endpoint", { timeout: 10_000 }, async (t) => {
   const { app, serverUrl, request } = await startRelay(t, { worker: false });
   const initialized = await request("/mcp", { method: "POST", body: {

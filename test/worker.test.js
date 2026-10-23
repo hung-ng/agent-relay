@@ -379,32 +379,46 @@ process.stderr.write("😀".repeat(100_000));`], { timeoutMs: 3000 });
   assert.ok(Buffer.byteLength(JSON.stringify(reply)) < 1_048_576);
 });
 
-test("failed task processes stop their descendants before a retry", { skip: process.platform === "win32", timeout: 5000 }, async (t) => {
-  for (const stdio of ["ignore", "inherit"]) {
-    await t.test(stdio, async (t) => {
-      const root = await mkdtemp(path.join(os.tmpdir(), "agent-relay-failed-process-"));
-      const descendantPath = path.join(root, "descendant.mjs");
-      const marker = path.join(root, "ticks");
-      const pidFile = path.join(root, "pid");
-      t.after(async () => {
-        const pid = await readFile(pidFile, "utf8").then(Number).catch(() => null);
-        if (pid) {
-          try { process.kill(pid, "SIGKILL"); } catch { /* The descendant already exited. */ }
-        }
-        await rm(root, { recursive: true, force: true });
-      });
-      await writeFile(descendantPath, `import fs from "node:fs";
+test("task process completion stops descendants on success and failure", { skip: process.platform === "win32", timeout: 5000 }, async (t) => {
+  for (const code of [0, 1]) {
+    for (const stdio of ["ignore", "inherit"]) {
+      await t.test(`exit ${code}, ${stdio}`, async (t) => {
+        const root = await mkdtemp(path.join(os.tmpdir(), "agent-relay-completed-process-"));
+        const descendantPath = path.join(root, "descendant.mjs");
+        const marker = path.join(root, "ticks");
+        const pidFile = path.join(root, "pid");
+        t.after(async () => {
+          const pid = await readFile(pidFile, "utf8").then(Number).catch(() => null);
+          if (pid) {
+            try { process.kill(pid, "SIGKILL"); } catch { /* The descendant already exited. */ }
+          }
+          await rm(root, { recursive: true, force: true });
+        });
+        await writeFile(descendantPath, `import fs from "node:fs";
 process.on("SIGTERM", () => {});
 fs.writeFileSync(process.argv[3], String(process.pid));
 setInterval(() => fs.appendFileSync(process.argv[2], "tick"), 5);`);
-      await assert.rejects(runProcess(process.execPath, ["-e", `
+        const running = runProcess(process.execPath, ["-e", `
 const fs = require("node:fs");
 require("node:child_process").spawn(process.execPath, process.argv.slice(1, 4), { stdio: process.argv[4] });
-setInterval(() => { if (fs.existsSync(process.argv[2])) process.exit(1); }, 5);`, descendantPath, marker, pidFile, stdio], { timeoutMs: 2000 }), /exited with code 1/);
-      await delay(30);
-      const stopped = await readFile(marker, "utf8");
-      await delay(80);
-      assert.equal(await readFile(marker, "utf8"), stopped);
-    });
+setInterval(() => {
+  if (fs.existsSync(process.argv[2])) {
+    process.stdout.write("completed");
+    process.exit(Number(process.argv[5]));
+  }
+}, 5);`, descendantPath, marker, pidFile, stdio, String(code)], { timeoutMs: 2000 });
+        if (code === 0) {
+          const result = await running;
+          assert.equal(result.code, 0);
+          assert.equal(result.stdout, "completed");
+        } else {
+          await assert.rejects(running, /exited with code 1/);
+        }
+        await delay(30);
+        const stopped = await readFile(marker, "utf8");
+        await delay(80);
+        assert.equal(await readFile(marker, "utf8"), stopped);
+      });
+    }
   }
 });

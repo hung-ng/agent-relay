@@ -1,4 +1,5 @@
 export const MAX_JSON_BYTES = 1_048_576;
+export const MAX_JSON_DEPTH = 128;
 
 export async function readJsonBody(request, { maxBytes = MAX_JSON_BYTES } = {}) {
   const declaredLength = Number(request.headers?.["content-length"]);
@@ -28,6 +29,18 @@ export async function readJsonBody(request, { maxBytes = MAX_JSON_BYTES } = {}) 
   }
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw bodyError("request body must be a JSON object", 400);
+  }
+  const pending = [{ value, depth: 1 }];
+  while (pending.length) {
+    const { value: current, depth } = pending.pop();
+    for (const child of Object.values(current)) {
+      if (child !== null && typeof child === "object") {
+        if (depth === MAX_JSON_DEPTH) {
+          throw bodyError(`request body exceeds ${MAX_JSON_DEPTH} levels of nesting`, 400);
+        }
+        pending.push({ value: child, depth: depth + 1 });
+      }
+    }
   }
   return value;
 }

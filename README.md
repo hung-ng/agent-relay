@@ -14,9 +14,11 @@ npm start -- --host 127.0.0.1 --port 8787
 
 Set `AGENT_RELAY_TOKEN` before allowing network access. Keep remote workers behind Tailscale or another private HTTPS network. The relay assumes trusted workers under one operator.
 
-JSON request bodies are limited to 1 MiB and require valid UTF-8. The HTTP and MCP endpoints reject malformed encoding with HTTP 400 before storing messages or jobs.
+JSON request bodies are limited to 1 MiB and 128 nested objects or arrays, including the root object. They require valid UTF-8. The HTTP and MCP endpoints reject malformed encoding or excessive nesting with HTTP 400 before storing messages or jobs. Braces and brackets inside strings do not count toward the nesting limit.
 
 Message and job IDs are trimmed at creation and limited to 4096 characters after `encodeURIComponent`. Reply message IDs allow 4104 characters to fit the generated `reply:` prefix. IDs cannot be `.` or `..`, contain NUL, or contain unpaired Unicode surrogates. Agent identities and sender, recipient, and requester references must also roundtrip the `X-Agent-Id` header without changes, so they require Latin-1 characters, no ASCII control characters, and no leading or trailing spaces. Hosts and conversation IDs cannot contain NUL or unpaired surrogates. Message bodies and job payload text retain their Unicode support.
+
+Capabilities, agent and job kinds, and message types reject NUL and unpaired Unicode surrogates before storage. Valid Unicode capability names remain supported.
 
 For a coordinated credential change, the coordinator can temporarily accept the old credential through `AGENT_RELAY_PREVIOUS_TOKEN` while `AGENT_RELAY_TOKEN` holds the new one. A previous token requires a nonempty primary token. After every worker and client has switched, remove the previous token and restart the coordinator to revoke it. Both credentials grant the same access during the overlap.
 
@@ -60,7 +62,7 @@ Run each worker under `launchd` so it reconnects after a reboot. The worker make
 
 ## Connect Claude Code and Codex
 
-The coordinator exposes a small MCP endpoint at `/mcp`.
+The coordinator exposes a small MCP endpoint at `/mcp`. Tool result text uses compact JSON so indentation cannot inflate deeply nested results.
 
 It negotiates protocol `2025-06-18` during initialization. Unsupported `MCP-Protocol-Version` headers receive HTTP 400 before tool execution. Requests without that header remain accepted for existing clients. The endpoint accepts POST messages; GET streams and DELETE session requests receive HTTP 405 with `Allow: POST`, following the [MCP lifecycle](https://modelcontextprotocol.io/specification/2025-06-18/basic/lifecycle) and [transport rules](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports).
 
@@ -192,7 +194,7 @@ The first worker supports `network.probe` and `agent.task`. Add another job type
 
 Agent tasks stop after ten minutes by default so a stalled subprocess cannot hold a durable job forever. Set `AGENT_RELAY_TASK_TIMEOUT_MS` or pass `--task-timeout-ms` to the worker to change the limit, up to 24 hours.
 
-On macOS and Linux, an unsuccessful CLI exit also terminates remaining subprocesses before the job can retry.
+On macOS and Linux, every CLI exit terminates remaining subprocesses in its process group. A successful task cannot leave those subprocesses running or wait indefinitely for output pipes they inherited.
 
 Workers send prompts through stdin, so large prompts and text beginning with a CLI flag stay task input. Codex tasks use a read-only sandbox and `approval_policy="never"` unless they explicitly request authorized write execution. Claude print workers use `dontAsk` permission mode, which denies operations that require an interactive permission prompt.
 

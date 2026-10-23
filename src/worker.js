@@ -473,9 +473,8 @@ export function runProcess(command, args, { timeoutMs, signal, input, ...spawnOp
       cleanup();
       reject(error);
     });
-    child.once("exit", (code) => {
-      if (code !== 0) kill("SIGKILL");
-    });
+    // Descendants can keep output pipes open after their parent exits.
+    child.once("exit", () => kill("SIGKILL"));
     child.on("close", (code, signal) => {
       if (stopping) kill("SIGKILL");
       cleanup();

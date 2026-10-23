@@ -263,7 +263,7 @@ async function callTool(name, args, { store, publish }) {
       throw new Error(`unknown tool: ${name}`);
   }
   return {
-    content: [{ type: "text", text: JSON.stringify(value, null, 2) }],
+    content: [{ type: "text", text: JSON.stringify(value) }],
     ...(value !== null && typeof value === "object" && !Array.isArray(value) ? { structuredContent: value } : {})
   };
 }

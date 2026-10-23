@@ -17,6 +17,7 @@ function requestFor(method, url, body, headers = {}) {
 function responseFor(resolve) {
   return {
     headers: {},
+    setHeader(name, value) { this.headers[name] = value; },
     writeHead(status, headers = {}) {
       this.status = status;
       this.headers = { ...this.headers, ...headers };
@@ -35,6 +36,92 @@ async function jsonRequest(app, method, url, body, headers) {
   const value = response.body ? JSON.parse(response.body) : null;
   return { response, value };
 }
+
+test("routing text validation covers direct Store writes", (t) => {
+  const app = createServer({ dbPath: ":memory:", token: "" });
+  t.after(() => app.close());
+  for (const suffix of ["\0private-value", "\ud800private-value", "\udfffprivate-value"]) {
+    const badCapability = "agent.task" + suffix;
+    for (const operation of [
+      () => app.store.registerAgent({ id: "worker", hostId: "host", capabilities: [badCapability] }),
+      () => app.store.registerAgent({ id: "worker", hostId: "host", kind: "codex" + suffix }),
+      () => app.store.createJob({ kind: "agent.task" + suffix, requestedBy: "operator" }),
+      () => app.store.createJob({ kind: "agent.task", requestedBy: "operator", requiredCapability: badCapability }),
+      () => app.store.createMessage({ sender: "operator", recipient: "worker", type: "request" + suffix })
+    ]) assert.throws(operation, error => error.status === 400 && !error.message.includes("private-value"));
+  }
+  for (const table of ["agents", "jobs", "messages"]) {
+    assert.equal(app.store.db.prepare(`SELECT count(*) AS count FROM ${table}`).get().count, 0);
+  }
+});
+
+test("routing text is rejected through HTTP and MCP before persistence", async (t) => {
+  const app = createServer({ dbPath: ":memory:", token: "" });
+  t.after(() => app.close());
+  app.store.registerAgent({ id: "worker", hostId: "host", kind: "codex", capabilities: ["agent.task"] });
+  const call = async (name, args) => {
+    const { response, value } = await jsonRequest(app, "POST", "/mcp", {
+      jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args }
+    });
+    assert.equal(response.status, 200);
+    assert.equal(value.result.isError, true);
+    assert.ok(!value.result.content[0].text.includes("private-value"));
+  };
+  const reject = async (route, body) => {
+    const { response, value } = await jsonRequest(app, "POST", route, body);
+    assert.equal(response.status, 400);
+    assert.ok(!value.error.includes("private-value"));
+  };
+  for (const suffix of ["\0private-value", "\ud800private-value", "\udfffprivate-value"]) {
+    const capability = "agent.task" + suffix;
+    for (const fields of [{ capabilities: [capability] }, { kind: "codex" + suffix }]) {
+      await reject("/v1/agents/register", { id: "new-worker", host_id: "host", ...fields });
+      await call("register_agent", { agent_id: "new-worker", host_id: "host", ...fields });
+    }
+    // Legacy capability JSON can preserve values that raw SQLite routing fields cannot.
+    app.store.db.prepare("UPDATE agents SET capabilities = ? WHERE id = ?")
+      .run(JSON.stringify(["agent.task", capability]), "worker");
+    for (const fields of [{ capability }, { kind: "agent.task" + suffix, capability: "agent.task" }]) {
+      const job = { kind: "agent.task", requested_by: "operator", target_agent: "worker", payload: { prompt: "inspect" }, ...fields };
+      await reject("/v1/jobs", job);
+      await call("dispatch_job", job);
+    }
+    const message = { sender: "operator", recipient: "worker", type: "request" + suffix, body: "inspect" };
+    await reject("/v1/messages", message);
+    await call("send_message", message);
+  }
+  assert.equal(app.store.listAgents().length, 1);
+  for (const table of ["jobs", "messages"]) {
+    assert.equal(app.store.db.prepare(`SELECT count(*) AS count FROM ${table}`).get().count, 0);
+  }
+});
+
+test("routing text preserves Unicode, normalization, and same-ID replay", async (t) => {
+  const app = createServer({ dbPath: ":memory:", token: "" });
+  t.after(() => app.close());
+  const capability = "custom/雪😀";
+  const payloadText = "text\0\ud800😀";
+  const agent = app.store.registerAgent({ id: "worker", hostId: "host", kind: "codex", capabilities: [" " + capability + " ", capability] });
+  assert.deepEqual(agent.capabilities, [capability]);
+  const { response, value } = await jsonRequest(app, "POST", "/v1/jobs", {
+    id: "job", kind: "agent.task", capability, requested_by: "operator", target_agent: "worker", payload: { prompt: payloadText }
+  });
+  assert.equal(response.status, 201);
+  assert.equal(value.job.required_capability, capability);
+  assert.equal(value.job.payload.prompt, payloadText);
+  const claim = await jsonRequest(app, "POST", "/v1/jobs/job/claim", { agent_id: "worker", claim_token_version: 1 }, { "x-agent-id": "worker" });
+  assert.equal(claim.response.status, 200);
+  assert.equal(claim.value.job.status, "running");
+  const replay = await jsonRequest(app, "POST", "/v1/jobs", {
+    id: "job", kind: "invalid\0kind", capability: "invalid\ud800capability", requested_by: "operator", target_agent: "worker", payload: {}
+  });
+  assert.equal(replay.response.status, 201);
+  assert.deepEqual(replay.value.job, claim.value.job);
+  const message = app.store.createMessage({ id: "message", sender: "operator", recipient: "worker", type: capability, payload: { body: payloadText } });
+  assert.equal(message.type, capability);
+  assert.equal(message.payload.body, payloadText);
+  assert.deepEqual(app.store.createMessage({ id: "message", sender: "operator", recipient: "worker", type: "request\0invalid" }), message);
+});
 
 test("coordinator accepts both rotation credentials and rejects the previous one after revocation", async (t) => {
   const overlapping = createServer({ dbPath: ":memory:", token: "new-token", previousToken: "old-token" });

@@ -18,6 +18,7 @@ export function dispatchJob({ store, publish }, input) {
   const existing = id ? store.getJob(id) : null;
   if (existing) return existing;
 
+  validateIdentifier(input.kind, "kind");
   validateAgentId(input.requested_by, "requested_by");
   if (input.target_agent !== undefined && input.target_agent !== null) validateAgentId(input.target_agent, "target_agent");
   if (input.source_host !== undefined && input.source_host !== null) validateIdentifier(input.source_host, "source_host");
