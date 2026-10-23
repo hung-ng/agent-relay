@@ -2,7 +2,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
-import { mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
 
 export async function backupDatabase({
   dbPath = process.env.AGENT_RELAY_DB ?? path.resolve("data/agent-relay.db"),
@@ -12,18 +12,20 @@ export async function backupDatabase({
 } = {}) {
   if (!dbPath || dbPath === ":memory:") throw new Error("a file-backed SQLite database is required");
   const keep = Math.max(1, Number.isFinite(retention) ? Math.floor(retention) : 7);
-  await mkdir(backupDir, { recursive: true, mode: 0o700 });
-
-  const lockPath = path.join(backupDir, ".backup.lock");
-  await acquireLock(lockPath);
-
   const stamp = clock().toISOString().replace(/[-:]/g, "").replace(".", "");
+  await mkdir(backupDir, { recursive: true, mode: 0o700 });
+  const lockPath = path.join(backupDir, ".backup.lock");
   const backupPath = path.join(backupDir, `agent-relay-${stamp}.db`);
   const partialPath = `${backupPath}.partial`;
-  let source;
+  let source = new DatabaseSync(dbPath, { readOnly: true });
+  let release;
+  let ownsLegacyLock = false;
   try {
+    release = await acquireMutex(path.join(backupDir, ".backup-lock.sqlite"));
+    await acquireLock(lockPath);
+    ownsLegacyLock = true;
     await unlink(partialPath).catch(() => {});
-    source = new DatabaseSync(dbPath);
+    await writeFile(partialPath, "", { flag: "wx", mode: 0o600 });
     source.exec("PRAGMA busy_timeout = 5000;");
     source.exec(`VACUUM INTO '${escapeSqlString(partialPath)}'`);
     source.close();
@@ -31,15 +33,36 @@ export async function backupDatabase({
 
     const integrity = verifyIntegrity(partialPath);
     if (integrity !== "ok") throw new Error(`backup integrity check failed: ${integrity}`);
+    await chmod(partialPath, 0o600);
     await rename(partialPath, backupPath);
 
     const removed = await pruneBackups(backupDir, keep);
     return { path: backupPath, integrity, removed, retained: keep };
   } finally {
     source?.close();
-    await unlink(partialPath).catch(() => {});
-    await unlink(lockPath).catch(() => {});
+    try {
+      if (ownsLegacyLock) {
+        await unlink(partialPath).catch(() => {});
+        await unlink(lockPath).catch(() => {});
+      }
+    } finally { release?.(); }
   }
+}
+
+async function acquireMutex(filename) {
+  const database = new DatabaseSync(filename);
+  try {
+    await chmod(filename, 0o600);
+    database.exec("PRAGMA busy_timeout = 0; BEGIN EXCLUSIVE;");
+  } catch (error) {
+    database.close();
+    if (error.errcode === 5 || error.errcode === 6) throw new Error("a database backup is already running");
+    throw error;
+  }
+  return () => {
+    try { database.exec("ROLLBACK"); }
+    finally { database.close(); }
+  };
 }
 
 async function acquireLock(lockPath) {
@@ -89,6 +112,7 @@ async function pruneBackups(backupDir, retention) {
     .sort()
     .reverse();
   const removed = [];
+  for (const name of names.slice(0, retention)) await chmod(path.join(backupDir, name), 0o600);
   for (const name of names.slice(retention)) {
     await unlink(path.join(backupDir, name));
     removed.push(name);

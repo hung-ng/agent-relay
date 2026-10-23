@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { normalizeJobPayload, requiredCapabilityForJob } from "./routing.js";
+import { dispatchJob } from "./jobs.js";
 import { readJsonBody } from "./body.js";
 
 const SERVER_INFO = {
@@ -143,9 +143,12 @@ export function createMcpHandler({ store, publish }) {
     try {
       body = await readJsonBody(request);
     } catch (error) {
-      return sendJson(response, 400, jsonRpcError(null, -32700, error.message));
+      return sendJson(response, error.status ?? 400, jsonRpcError(null, -32700, error.message));
     }
-    if (body.method?.startsWith("notifications/")) {
+    if (body.jsonrpc !== "2.0" || typeof body.method !== "string") {
+      return sendJson(response, 400, jsonRpcError(body.id ?? null, -32600, "invalid JSON-RPC request"));
+    }
+    if (body.method.startsWith("notifications/")) {
       response.writeHead(202);
       response.end();
       return;
@@ -157,7 +160,7 @@ export function createMcpHandler({ store, publish }) {
       response.setHeader("MCP-Protocol-Version", body.params?.protocolVersion ?? "2025-06-18");
       return sendJson(response, 200, { jsonrpc: "2.0", id: body.id ?? null, result });
     } catch (error) {
-      return sendJson(response, 200, jsonRpcError(body.id ?? null, -32603, error.message));
+      return sendJson(response, 200, jsonRpcError(body.id ?? null, error.rpcCode ?? -32603, error.message));
     }
   };
 }
@@ -175,13 +178,18 @@ async function handleRequest(body, context) {
     case "tools/list":
       return { tools: mcpTools() };
     case "tools/call":
-      return callTool(body.params?.name, body.params?.arguments ?? {}, context);
+      try { return await callTool(body.params?.name, body.params?.arguments ?? {}, context); }
+      catch (error) {
+        if (error.rpcCode) throw error;
+        return { isError: true, content: [{ type: "text", text: error.message }] };
+      }
     default:
-      throw new Error(`unknown MCP method: ${body.method}`);
+      throw Object.assign(new Error(`unknown MCP method: ${body.method}`), { rpcCode: -32601 });
   }
 }
 
 async function callTool(name, args, { store, publish }) {
+  validateToolArguments(name, args);
   let value;
   switch (name) {
     case "register_agent":
@@ -205,7 +213,7 @@ async function callTool(name, args, { store, publish }) {
         conversationId: args.conversation_id ?? null,
         payload: { body: args.body }
       });
-      publish(args.recipient, "message.created", message);
+      publish(message.recipient, "message.created", message);
       value = message;
       break;
     }
@@ -220,44 +228,16 @@ async function callTool(name, args, { store, publish }) {
       if (!value) throw new Error(`message not found: ${args.message_id}`);
       break;
     case "dispatch_job": {
-      const payload = normalizeJobPayload({
-        kind: args.kind,
-        payload: args.payload,
-        sourceHost: args.source_host,
-        targetHost: args.target_host
-      });
-      const requiredCapability = requiredCapabilityForJob({ kind: args.kind, capability: args.capability, payload });
-      const targetAgent = args.target_agent ?? (args.source_host ? store.findAgentForHost(args.source_host, requiredCapability)?.id : null);
-      if (!targetAgent) throw new Error("no target agent is registered for this job");
-      if (!store.agentSupports(targetAgent, requiredCapability)) throw new Error("target agent does not provide the required capability");
-      if (payload.workflow && store.getAgent(targetAgent)?.kind !== "codex") throw new Error("workflow tasks require a codex agent");
-      const job = store.createJob({
-        id: args.id,
-        kind: args.kind,
-        requiredCapability,
-        maxAttempts: args.max_attempts,
-        requestedBy: args.requested_by,
-        targetAgent,
-        sourceHost: args.source_host ?? null,
-        targetHost: args.target_host ?? null,
-        payload
-      });
-      publish(targetAgent, "job.created", job);
-      value = job;
+      value = dispatchJob({ store, publish }, args);
       break;
     }
     case "run_probe": {
-      const targetAgent = store.findAgentForHost(args.source_host, "network.probe")?.id;
-      if (!targetAgent) throw new Error(`no network probe worker is registered for ${args.source_host}`);
-      const job = store.createJob({
+      value = dispatchJob({ store, publish }, {
         id: args.id,
         kind: "network.probe",
-        requiredCapability: "network.probe",
-        maxAttempts: 3,
-        requestedBy: args.requested_by,
-        targetAgent,
-        sourceHost: args.source_host,
-        targetHost: args.target_host ?? null,
+        requested_by: args.requested_by,
+        source_host: args.source_host,
+        target_host: args.target_host,
         payload: {
           source_host: args.source_host,
           target_host: args.target_host ?? null,
@@ -265,8 +245,6 @@ async function callTool(name, args, { store, publish }) {
           timeout_ms: args.timeout_ms
         }
       });
-      publish(targetAgent, "job.created", job);
-      value = job;
       break;
     }
     case "get_job":
@@ -281,8 +259,31 @@ async function callTool(name, args, { store, publish }) {
   }
   return {
     content: [{ type: "text", text: JSON.stringify(value, null, 2) }],
-    structuredContent: value
+    ...(value !== null && typeof value === "object" && !Array.isArray(value) ? { structuredContent: value } : {})
   };
+}
+
+function validateToolArguments(name, args) {
+  const tool = mcpTools().find((candidate) => candidate.name === name);
+  const invalid = (message) => { throw Object.assign(new Error(message), { rpcCode: -32602 }); };
+  if (!tool) invalid(`unknown tool: ${name}`);
+  if (args === null || typeof args !== "object" || Array.isArray(args)) invalid("tool arguments must be an object");
+  for (const field of tool.inputSchema.required ?? []) {
+    if (args[field] === undefined) invalid(`${field} is required`);
+  }
+  for (const [field, schema] of Object.entries(tool.inputSchema.properties)) {
+    const value = args[field];
+    if (value === undefined) continue;
+    const matches = (value, type) => type === "integer" ? Number.isInteger(value)
+      : type === "array" ? Array.isArray(value)
+      : type === "object" ? value !== null && typeof value === "object" && !Array.isArray(value)
+      : typeof value === type;
+    if (!matches(value, schema.type)) invalid(`${field} must be ${schema.type}`);
+    if (schema.type === "string" && !value.trim()) invalid(`${field} must be a non-empty string`);
+    if (schema.minimum !== undefined && value < schema.minimum) invalid(`${field} must be at least ${schema.minimum}`);
+    if (schema.maximum !== undefined && value > schema.maximum) invalid(`${field} must be at most ${schema.maximum}`);
+    if (schema.items && value.some((item) => !matches(item, schema.items.type))) invalid(`${field} has an invalid item`);
+  }
 }
 
 async function waitForJob(store, id, timeoutMs = 10000) {

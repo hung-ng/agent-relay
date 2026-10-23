@@ -28,9 +28,16 @@ export async function requestJson(
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: requestSignal
     });
-    const value = await response.json().catch(() => ({}));
+    let value;
+    try {
+      value = await response.json();
+    } catch (error) {
+      if (requestSignal?.aborted) throw requestSignal.reason;
+      if (response.ok) throw Object.assign(new Error("response is not valid JSON", { cause: error }), { code: "EINVALIDJSON" });
+      value = {};
+    }
     if (!response.ok) {
-      const error = new Error(value.error ?? `request failed: ${response.status}`);
+      const error = new Error(value?.error ?? `request failed: ${response.status}`);
       error.status = response.status;
       throw error;
     }

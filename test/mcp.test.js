@@ -62,3 +62,61 @@ test("MCP exposes tools and routes a message", async () => {
   assert.equal(job.required_capability, "agent.task");
   store.close();
 });
+
+test("MCP rejects malformed methods and tool arguments without throwing", async (t) => {
+  const store = new Store(":memory:");
+  t.after(() => store.close());
+  const handler = createMcpHandler({ store, publish() {} });
+  for (const method of [123, {}, null]) {
+    const response = responseFor();
+    await handler(requestFor({ jsonrpc: "2.0", id: 1, method }), response);
+    assert.equal(JSON.parse(response.body).error.code, -32600);
+  }
+  for (const args of [[], "bad", { sender: "worker" }, { sender: "worker", recipient: {}, body: "hi" }]) {
+    const response = responseFor();
+    await handler(requestFor({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "send_message", arguments: args } }), response);
+    assert.equal(JSON.parse(response.body).error.code, -32602);
+  }
+  assert.equal(store.db.prepare("SELECT count(*) AS count FROM messages").get().count, 0);
+});
+
+test("MCP message retries publish to the original recipient", async (t) => {
+  const store = new Store(":memory:");
+  t.after(() => store.close());
+  const published = [];
+  const handler = createMcpHandler({ store, publish: (...args) => published.push(args) });
+  for (const recipient of ["original", "other"]) {
+    await handler(requestFor({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+      name: "send_message", arguments: { id: "stable", sender: "sender", recipient, body: "hi" }
+    } }), responseFor());
+  }
+  assert.deepEqual(published.map(([recipient]) => recipient), ["original", "original"]);
+});
+
+test("MCP array and null tool results remain valid text-only results", async (t) => {
+  const store = new Store(":memory:");
+  t.after(() => store.close());
+  const handler = createMcpHandler({ store, publish() {} });
+  for (const [name, args, expected] of [
+    ["list_agents", {}, []], ["get_inbox", { agent_id: "worker" }, []],
+    ["wait_for_message", { agent_id: "worker", timeout_ms: 100 }, null]
+  ]) {
+    const response = responseFor();
+    await handler(requestFor({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }), response);
+    const result = JSON.parse(response.body).result;
+    assert.equal(Object.hasOwn(result, "structuredContent"), false);
+    assert.deepEqual(JSON.parse(result.content[0].text), expected);
+  }
+});
+
+test("MCP returns an execution error when a valid dispatch has no target", async (t) => {
+  const store = new Store(":memory:");
+  t.after(() => store.close());
+  const response = responseFor();
+  await createMcpHandler({ store, publish() {} })(requestFor({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+    name: "dispatch_job", arguments: { kind: "agent.task", requested_by: "operator", target_agent: "missing", payload: { prompt: "inspect" } }
+  } }), response);
+  const value = JSON.parse(response.body);
+  assert.equal(value.result.isError, true);
+  assert.match(value.result.content[0].text, /capability/);
+});

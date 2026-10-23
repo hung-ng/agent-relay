@@ -1,5 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
+import { chmodSync } from "node:fs";
 import {
   normalizeCapabilities,
   normalizeMetadata,
@@ -11,6 +12,7 @@ const now = () => new Date().toISOString();
 export class Store {
   constructor(filename = "./data/agent-relay.db") {
     this.db = new DatabaseSync(filename);
+    if (filename !== ":memory:") chmodSync(filename, 0o600);
     this.db.exec("PRAGMA journal_mode = WAL;");
     this.db.exec("PRAGMA busy_timeout = 5000;");
     this.db.exec("PRAGMA foreign_keys = ON;");
@@ -56,7 +58,8 @@ export class Store {
         created_at TEXT NOT NULL,
         started_at TEXT,
         completed_at TEXT,
-        claimed_by TEXT
+        claimed_by TEXT,
+        claim_token TEXT
       );
 
       CREATE INDEX IF NOT EXISTS messages_recipient_status
@@ -77,6 +80,9 @@ export class Store {
     }
     if (!jobColumns.some((column) => column.name === "max_attempts")) {
       this.db.exec("ALTER TABLE jobs ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 3");
+    }
+    if (!jobColumns.some((column) => column.name === "claim_token")) {
+      this.db.exec("ALTER TABLE jobs ADD COLUMN claim_token TEXT");
     }
   }
 
@@ -165,12 +171,13 @@ export class Store {
       if (!existing || existing.status !== "running") continue;
       const error = "target agent went offline before completing the job";
       const terminal = existing.attempts >= existing.max_attempts;
-      this.db.prepare(`
+      const result = this.db.prepare(`
         UPDATE jobs
-        SET status = ?, error = ?, completed_at = ?, started_at = NULL, claimed_by = NULL
-        WHERE id = ? AND status = 'running'
-      `).run(terminal ? "failed" : "queued", error, terminal ? now() : null, row.id);
-      jobs.push(this.getJob(row.id));
+        SET status = ?, error = ?, completed_at = ?, started_at = NULL, claimed_by = NULL, claim_token = NULL
+        WHERE id = ? AND status = 'running' AND claim_token IS ? AND attempts = ?
+          AND EXISTS (SELECT 1 FROM agents WHERE agents.id = jobs.target_agent AND agents.status = 'offline')
+      `).run(terminal ? "failed" : "queued", error, terminal ? now() : null, row.id, existing.claim_token, existing.attempts);
+      if (result.changes > 0) jobs.push(this.getJob(row.id));
     }
     return jobs;
   }
@@ -199,7 +206,7 @@ export class Store {
       WHERE recipient = ?
       ORDER BY created_at DESC
       LIMIT ?
-    `).all(recipient, Math.min(Math.max(Number(limit) || 50, 1), 200));
+    `).all(recipient, normalizeLimit(limit));
     return rows.map((row) => this.#message(row));
   }
 
@@ -209,12 +216,12 @@ export class Store {
       WHERE recipient = ? AND status = 'queued'
       ORDER BY created_at ASC
       LIMIT ?
-    `).all(recipient, Math.min(Math.max(Number(limit) || 50, 1), 200));
+    `).all(recipient, normalizeLimit(limit));
     return rows.map((row) => this.#message(row));
   }
 
   getPendingWork(agentId, limit = 50) {
-    const boundedLimit = Math.min(Math.max(Number(limit) || 50, 1), 200);
+    const boundedLimit = normalizeLimit(limit);
     const messages = this.db.prepare(`
       SELECT * FROM messages
       WHERE recipient = ? AND status IN ('queued', 'delivered')
@@ -264,7 +271,8 @@ export class Store {
   createJob({ id, kind, requiredCapability = null, maxAttempts = 3, requestedBy, targetAgent = null, sourceHost = null, targetHost = null, payload = {} }) {
     const jobId = normalizeId(id, "job");
     const timestamp = now();
-    const boundedAttempts = Math.min(Math.max(Number(maxAttempts) || 3, 1), 10);
+    const parsedAttempts = Number(maxAttempts);
+    const boundedAttempts = Number.isFinite(parsedAttempts) ? Math.min(Math.max(Math.floor(parsedAttempts) || 3, 1), 10) : 3;
     this.db.prepare(`
       INSERT INTO jobs
         (id, kind, required_capability, requested_by, target_agent, source_host, target_host, payload, status, attempts, max_attempts, created_at)
@@ -279,13 +287,13 @@ export class Store {
     return row ? this.#job(row) : null;
   }
 
-  claimJob(id, agentId) {
+  claimJob(id, agentId, { withToken = true } = {}) {
     const timestamp = now();
     const result = this.db.prepare(`
       UPDATE jobs
-      SET status = 'running', claimed_by = ?, started_at = ?, attempts = attempts + 1
+      SET status = 'running', claimed_by = ?, started_at = ?, attempts = attempts + 1, claim_token = ?
       WHERE id = ? AND status = 'queued' AND (target_agent IS NULL OR target_agent = ?)
-    `).run(agentId, timestamp, id, agentId);
+    `).run(agentId, timestamp, withToken ? randomUUID() : null, id, agentId);
     if (result.changes > 0) return this.getJob(id);
     const existing = this.getJob(id);
     return existing?.status === 'running' && existing.claimed_by === agentId ? existing : null;
@@ -295,43 +303,48 @@ export class Store {
     return this.#finishJob(id, "completed", { result });
   }
 
-  completeJobBy(id, result, agentId) {
-    return this.#finishJob(id, "completed", { result }, agentId);
+  completeJobBy(id, result, agentId, claimToken = null) {
+    return this.#finishJob(id, "completed", { result }, agentId, claimToken);
   }
 
-  failJob(id, error) {
-    return this.#finishJob(id, "failed", { error });
+  failJob(id, error, { retryable = true } = {}) {
+    return this.#finishJob(id, "failed", { error, retryable });
   }
 
-  failJobBy(id, error, agentId) {
-    return this.#finishJob(id, "failed", { error }, agentId);
+  failJobBy(id, error, agentId, claimToken = null, { retryable = true } = {}) {
+    return this.#finishJob(id, "failed", { error, retryable }, agentId, claimToken);
   }
 
-  #finishJob(id, status, values, agentId = null) {
+  #finishJob(id, status, values, agentId = null, claimToken = null) {
     const existing = this.getJob(id);
     if (!existing || (agentId && existing.claimed_by !== agentId)) return null;
+    if (agentId && existing.claim_token !== claimToken) return null;
     const timestamp = now();
+    const claim = [id, existing.claim_token, existing.claimed_by, existing.attempts];
     if (status === "completed") {
       this.db.prepare(`
         UPDATE jobs SET status = 'completed', result = ?, error = NULL, completed_at = ?
-        WHERE id = ? AND status = 'running'
-      `).run(JSON.stringify(values.result ?? {}), timestamp, id);
+        WHERE id = ? AND status = 'running' AND claim_token IS ? AND claimed_by IS ? AND attempts = ?
+      `).run(JSON.stringify(values.result ?? {}), timestamp, ...claim);
     } else {
-      const terminal = existing.attempts >= existing.max_attempts;
+      const terminal = values.retryable === false || existing.attempts >= existing.max_attempts;
       const error = String(values.error ?? "job failed");
       if (terminal) {
         this.db.prepare(`
           UPDATE jobs SET status = 'failed', error = ?, completed_at = ?
-          WHERE id = ? AND status = 'running'
-        `).run(error, timestamp, id);
+          WHERE id = ? AND status = 'running' AND claim_token IS ? AND claimed_by IS ? AND attempts = ?
+        `).run(error, timestamp, ...claim);
       } else {
         this.db.prepare(`
-          UPDATE jobs SET status = 'queued', error = ?, completed_at = NULL, started_at = NULL, claimed_by = NULL
-          WHERE id = ? AND status = 'running'
-        `).run(error, id);
+          UPDATE jobs SET status = 'queued', error = ?, completed_at = NULL, started_at = NULL, claimed_by = NULL, claim_token = NULL
+          WHERE id = ? AND status = 'running' AND claim_token IS ? AND claimed_by IS ? AND attempts = ?
+        `).run(error, ...claim);
       }
     }
-    return this.getJob(id);
+    const current = this.getJob(id);
+    if (current?.attempts !== existing.attempts) return null;
+    if (current?.status === "running" && current.claim_token !== existing.claim_token) return null;
+    return current;
   }
 
   cancelJob(id) {
@@ -389,7 +402,8 @@ export class Store {
       created_at: row.created_at,
       started_at: row.started_at,
       completed_at: row.completed_at,
-      claimed_by: row.claimed_by
+      claimed_by: row.claimed_by,
+      claim_token: row.claim_token
     };
   }
 }
@@ -399,4 +413,9 @@ function normalizeId(value, type) {
   const normalized = String(value).trim();
   if (!normalized) throw new Error(`${type} id must be a non-empty string`);
   return normalized;
+}
+
+function normalizeLimit(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.min(Math.max(Math.floor(parsed) || 50, 1), 200) : 50;
 }

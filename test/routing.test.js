@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "../src/server.js";
+import { EventEmitter } from "node:events";
 
 function requestFor(method, url, body, headers = {}) {
   return {
@@ -195,14 +196,14 @@ test("worker actions require the matching authenticated agent", async (t) => {
     app,
     "POST",
     `/v1/jobs/${encodeURIComponent(createdJob.job.id)}/fail`,
-    { error: "first attempt failed" },
+    { error: "first attempt failed", claim_token: claimed.value.job.claim_token },
     { ...auth, "x-agent-id": "probe@mini" }
   );
   assert.equal(retried.response.status, 200);
   assert.equal(retried.value.job.status, "queued");
   assert.equal(retried.value.job.attempts, 1);
 
-  await jsonRequest(
+  const secondClaim = await jsonRequest(
     app,
     "POST",
     `/v1/jobs/${encodeURIComponent(createdJob.job.id)}/claim`,
@@ -213,7 +214,7 @@ test("worker actions require the matching authenticated agent", async (t) => {
     app,
     "POST",
     `/v1/jobs/${encodeURIComponent(createdJob.job.id)}/fail`,
-    { error: "second attempt failed" },
+    { error: "second attempt failed", claim_token: secondClaim.value.job.claim_token },
     { ...auth, "x-agent-id": "probe@mini" }
   );
   assert.equal(deadLetter.value.job.status, "failed");
@@ -232,7 +233,7 @@ test("rejects capability bypasses and malformed JSON bodies", async (t) => {
 
   const bypass = await jsonRequest(app, "POST", "/v1/jobs", {
     kind: "network.probe",
-    capability: "",
+    capability: "network.probe",
     requested_by: "service-monitor",
     target_agent: "probe@mini",
     payload: { checks: [] }
@@ -284,8 +285,9 @@ test("a retry wakes the target worker instead of only the requester", async (t) 
     target_agent: "probe@mini",
     payload: { checks: [] }
   });
-  await jsonRequest(app, "POST", `/v1/jobs/${created.job.id}/claim`, { agent_id: "probe@mini" }, { "x-agent-id": "probe@mini" });
-  await jsonRequest(app, "POST", `/v1/jobs/${created.job.id}/fail`, { error: "retry me" }, { "x-agent-id": "probe@mini" });
+  const claimed = await jsonRequest(app, "POST", `/v1/jobs/${created.job.id}/claim`, { agent_id: "probe@mini" }, { "x-agent-id": "probe@mini" });
+  const failed = await jsonRequest(app, "POST", `/v1/jobs/${created.job.id}/fail`, { error: "retry me", claim_token: claimed.value.job.claim_token }, { "x-agent-id": "probe@mini" });
+  assert.equal(failed.response.status, 200);
 
   const event = await Promise.race([
     retryEvent,
@@ -293,4 +295,73 @@ test("a retry wakes the target worker instead of only the requester", async (t) 
   ]);
   assert.match(event, /event: job\.created/);
   assert.match(event, new RegExp(created.job.id));
+});
+
+test("HTTP results require the current claim token while legacy claims still work", async (t) => {
+  const app = createServer({ dbPath: ":memory:", token: "" });
+  t.after(() => app.close());
+  app.store.registerAgent({ id: "worker", hostId: "host", capabilities: ["network.probe"] });
+  const headers = { "x-agent-id": "worker" };
+  for (const tokenVersion of [1, undefined]) {
+    const { value: { job } } = await jsonRequest(app, "POST", "/v1/jobs", {
+      kind: "network.probe", requested_by: "operator", target_agent: "worker", payload: { checks: [] }
+    });
+    const claim = await jsonRequest(app, "POST", `/v1/jobs/${job.id}/claim`, { agent_id: "worker", claim_token_version: tokenVersion }, headers);
+    if (tokenVersion) {
+      assert.ok(claim.value.job.claim_token);
+      const stale = await jsonRequest(app, "POST", `/v1/jobs/${job.id}/complete`, { result: {} }, headers);
+      assert.equal(stale.response.status, 409);
+      assert.equal(app.store.getJob(job.id).status, "running");
+    } else assert.equal(claim.value.job.claim_token, null);
+    const completed = await jsonRequest(app, "POST", `/v1/jobs/${job.id}/complete`, {
+      result: { ok: true }, claim_token: claim.value.job.claim_token
+    }, headers);
+    assert.equal(completed.response.status, 200);
+    assert.equal(completed.value.job.status, "completed");
+  }
+});
+
+test("job requests reject malformed options and workflow permission bypasses", async (t) => {
+  const app = createServer({ dbPath: ":memory:", token: "" });
+  t.after(() => app.close());
+  app.store.registerAgent({ id: "worker", hostId: "host", kind: "codex", capabilities: ["agent.task"] });
+  const base = { kind: "agent.task", requested_by: "operator", target_agent: "worker", payload: { prompt: "inspect" } };
+  for (const extra of [
+    { max_attempts: 1.5 }, { max_attempts: "3" }, { max_attempts: 11 }, { target_agent: {} }, { payload: [] },
+    { payload: { prompt: "inspect", execution_mode: "surprise" } },
+    { payload: { prompt: "inspect", workflow: "implement", execution_mode: "default" } },
+    { payload: { prompt: "inspect", workflow: "toString" } },
+    { payload: { prompt: "inspect", task_timeout_ms: 0 } }
+  ]) {
+    const result = await jsonRequest(app, "POST", "/v1/jobs", { ...base, ...extra });
+    assert.equal(result.response.status, 400, JSON.stringify(extra));
+  }
+  const implementation = await jsonRequest(app, "POST", "/v1/jobs", {
+    ...base, capability: "agent.task", payload: { prompt: "edit", workflow: "implement" }
+  });
+  assert.equal(implementation.response.status, 409);
+  assert.equal(app.store.db.prepare("SELECT count(*) AS count FROM jobs").get().count, 0);
+});
+
+test("SSE tolerates ordinary backpressure and disconnects only an excessive queue", async (t) => {
+  const app = createServer({ dbPath: ":memory:", token: "" });
+  t.after(() => app.close());
+  const request = Object.assign(new EventEmitter(), requestFor("GET", "/v1/events?agent_id=worker", undefined, { "x-agent-id": "worker" }));
+  const response = new EventEmitter();
+  const chunks = [];
+  Object.assign(response, {
+    writableLength: 0, destroyed: false,
+    writeHead() {},
+    write(chunk) { chunks.push(chunk); this.writableLength += Buffer.byteLength(chunk); return false; },
+    destroy() { this.destroyed = true; this.emit("close"); },
+    end() { this.emit("close"); }
+  });
+  app.server.emit("request", request, response);
+  await jsonRequest(app, "POST", "/v1/messages", { sender: "operator", recipient: "worker", payload: { body: "x".repeat(128_000) } });
+  assert.equal(response.destroyed, false);
+  assert.equal(chunks.length, 2);
+  response.writableLength = 2_097_152;
+  await jsonRequest(app, "POST", "/v1/messages", { sender: "operator", recipient: "worker", payload: { body: "more" } });
+  assert.equal(response.destroyed, true);
+  assert.equal(chunks.length, 2);
 });

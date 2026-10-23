@@ -41,14 +41,21 @@ export function listWorkflows() {
 }
 
 export function buildTaskPayload({ workflow = "prompt", prompt, cwd = null }) {
+  const executionMode = executionModeForWorkflow(workflow);
   const selected = WORKFLOWS[workflow];
-  if (!selected) throw new Error(`unknown workflow: ${workflow}; choose one of ${Object.keys(WORKFLOWS).join(", ")}`);
   const normalizedPrompt = String(prompt ?? "").trim();
   if (!normalizedPrompt) throw new Error("a non-empty prompt is required");
   return {
     workflow,
-    execution_mode: selected.executionMode,
+    execution_mode: executionMode,
     prompt: selected.build({ prompt: normalizedPrompt }),
     ...(cwd ? { cwd } : {})
   };
+}
+
+export function executionModeForWorkflow(workflow) {
+  if (typeof workflow !== "string" || !Object.hasOwn(WORKFLOWS, workflow)) {
+    throw new Error(`unknown workflow: ${workflow}; choose one of ${Object.keys(WORKFLOWS).join(", ")}`);
+  }
+  return WORKFLOWS[workflow].executionMode;
 }

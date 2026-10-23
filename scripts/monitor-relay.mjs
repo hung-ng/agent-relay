@@ -1,22 +1,31 @@
 #!/usr/bin/env node
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { requestJson } from "../src/http.js";
+import { writePrivateFile } from "../src/files.js";
 
 export async function checkRelay({
   baseUrl = process.env.AGENT_RELAY_MONITOR_URL ?? "http://127.0.0.1:8787",
   token = "",
   expectedAgentId = process.env.AGENT_RELAY_MONITOR_AGENT_ID ?? "probe@hung-mini",
   expectedCapability = process.env.AGENT_RELAY_MONITOR_CAPABILITY ?? "network.probe",
-  fetchImpl = fetch
+  fetchImpl = fetch,
+  timeoutMs = 10_000
 } = {}) {
   const url = baseUrl.replace(/\/$/, "");
   const headers = token ? { authorization: `Bearer ${token}` } : {};
-  const health = await requestJson(`${url}/healthz`, { headers, fetchImpl });
-  const readiness = await requestJson(`${url}/readyz`, { headers, fetchImpl });
-  const agents = await requestJson(`${url}/v1/agents`, { headers, fetchImpl });
-  const agent = agents.agents?.find((candidate) => candidate.id === expectedAgentId);
+  const controller = new AbortController();
+  let health, readiness, agents;
+  try {
+    [health, readiness, agents] = await Promise.all(["/healthz", "/readyz", "/v1/agents"].map((route) =>
+      requestJson(`${url}${route}`, { headers, fetchImpl, timeoutMs, signal: controller.signal })
+    ));
+  } finally { controller.abort(); }
+  if (health?.ok !== true || health.service !== "agent-relay") throw new Error("relay health check did not report success");
+  if (readiness?.ok !== true || readiness.service !== "agent-relay") throw new Error("relay readiness check did not report success");
+  if (!Array.isArray(agents?.agents)) throw new Error("relay returned an invalid agent list");
+  const agent = agents.agents.find((candidate) => candidate?.id === expectedAgentId);
   if (!agent) throw new Error(`expected agent is missing: ${expectedAgentId}`);
   if (agent.status !== "online") throw new Error(`expected agent is ${agent.status}: ${expectedAgentId}`);
   if (expectedCapability && !agent.capabilities?.includes(expectedCapability)) {
@@ -29,15 +38,17 @@ export async function runMonitor({
   tokenFile = process.env.AGENT_RELAY_TOKEN_FILE ?? path.resolve("data/agent-relay.token"),
   logFile = process.env.AGENT_RELAY_MONITOR_LOG ?? path.resolve("data/logs/monitor.log"),
   stateFile = process.env.AGENT_RELAY_MONITOR_STATE ?? path.resolve("data/monitor-state.json"),
+  baseUrl = process.env.AGENT_RELAY_MONITOR_URL ?? "http://127.0.0.1:8787",
   token = process.env.AGENT_RELAY_TOKEN,
   expectedAgentId = process.env.AGENT_RELAY_MONITOR_AGENT_ID ?? "probe@hung-mini",
   expectedCapability = process.env.AGENT_RELAY_MONITOR_CAPABILITY ?? "network.probe",
-  fetchImpl = fetch
+  fetchImpl = fetch,
+  timeoutMs = 10_000
 } = {}) {
   const resolvedToken = token || await readFile(tokenFile, "utf8").then((value) => value.trim()).catch(() => "");
   const checkedAt = new Date().toISOString();
   try {
-    const result = await checkRelay({ token: resolvedToken, expectedAgentId, expectedCapability, fetchImpl });
+    const result = await checkRelay({ baseUrl, token: resolvedToken, expectedAgentId, expectedCapability, fetchImpl, timeoutMs });
     await record({ logFile, stateFile, event: { checked_at: checkedAt, status: "ok", agent: result.agent } });
     return result;
   } catch (error) {
@@ -50,7 +61,7 @@ async function record({ logFile, stateFile, event }) {
   await mkdir(path.dirname(logFile), { recursive: true, mode: 0o700 });
   await mkdir(path.dirname(stateFile), { recursive: true, mode: 0o700 });
   await appendFile(logFile, `${JSON.stringify(event)}\n`, { mode: 0o600 });
-  await writeFile(stateFile, `${JSON.stringify(event, null, 2)}\n`, { mode: 0o600 });
+  await writePrivateFile(stateFile, `${JSON.stringify(event, null, 2)}\n`);
 }
 
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);

@@ -17,3 +17,10 @@ test("argument parsing does not consume the next flag", () => {
     host: "localhost"
   });
 });
+
+test("inline arguments preserve equals signs in prompts and URLs", () => {
+  assert.deepEqual(parseArgs(["--prompt=check x=y=z", "--server=https://relay/?a=b=c"]), {
+    prompt: "check x=y=z",
+    server: "https://relay/?a=b=c"
+  });
+});

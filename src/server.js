@@ -3,11 +3,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { Store } from "./store.js";
 import { createMcpHandler } from "./mcp.js";
-import { normalizeJobPayload, requiredCapabilityForJob } from "./routing.js";
+import { dispatchJob } from "./jobs.js";
 import { readJsonBody } from "./body.js";
 
+const MAX_EVENT_QUEUE_BYTES = 2_097_152;
+
 export function createServer({ dbPath = "./data/agent-relay.db", token = process.env.AGENT_RELAY_TOKEN ?? "" } = {}) {
-  fs.mkdirSync(path.dirname(path.resolve(dbPath)), { recursive: true });
+  fs.mkdirSync(path.dirname(path.resolve(dbPath)), { recursive: true, mode: 0o700 });
   const store = new Store(dbPath);
   const subscribers = new Map();
   const refreshStaleWork = () => {
@@ -21,10 +23,8 @@ export function createServer({ dbPath = "./data/agent-relay.db", token = process
     const listeners = subscribers.get(agentId) ?? new Set();
     for (const response of listeners) {
       try {
-        const accepted = response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-        if (accepted === false) {
+        if (!writeEvent(response, `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)) {
           listeners.delete(response);
-          response.destroy?.();
         }
       } catch {
         listeners.delete(response);
@@ -39,7 +39,7 @@ export function createServer({ dbPath = "./data/agent-relay.db", token = process
     try {
       if (request.method === "OPTIONS") return sendJson(response, 204, null);
       if (!authenticate(request, token)) return sendJson(response, 401, { error: "unauthorized" });
-      const url = new URL(request.url, `http://${request.headers.host ?? "localhost"}`);
+      const url = new URL(request.url, "http://localhost");
 
       if (url.pathname === "/healthz" && request.method === "GET") {
         return sendJson(response, 200, { ok: true, service: "agent-relay" });
@@ -48,7 +48,7 @@ export function createServer({ dbPath = "./data/agent-relay.db", token = process
         store.checkReady();
         return sendJson(response, 200, { ok: true, service: "agent-relay" });
       }
-      if (url.pathname === "/mcp" && request.method === "POST") return mcpHandler(request, response);
+      if (url.pathname === "/mcp" && request.method === "POST") return await mcpHandler(request, response);
       if (url.pathname === "/v1/events" && request.method === "GET") {
         const agentId = url.searchParams.get("agent_id");
         const actor = agentIdentity(request);
@@ -124,36 +124,7 @@ export function createServer({ dbPath = "./data/agent-relay.db", token = process
       }
       if (url.pathname === "/v1/jobs" && request.method === "POST") {
         const body = await readJsonBody(request);
-        if (!isNonEmptyString(body.kind) || !isNonEmptyString(body.requested_by) || !isOptionalId(body.id)) {
-          return sendJson(response, 400, { error: "kind and requested_by are required" });
-        }
-        const payload = normalizeJobPayload({
-          kind: body.kind,
-          payload: body.payload,
-          sourceHost: body.source_host,
-          targetHost: body.target_host
-        });
-        const requiredCapability = requiredCapabilityForJob({ kind: body.kind, capability: body.capability, payload });
-        const targetAgent = body.target_agent ?? (body.source_host ? store.findAgentForHost(body.source_host, requiredCapability)?.id : null);
-        if (!targetAgent) return sendJson(response, 409, { error: "no target agent is registered" });
-        if (!store.agentSupports(targetAgent, requiredCapability)) {
-          return sendJson(response, 409, { error: "target agent does not provide the required capability" });
-        }
-        if (payload.workflow && store.getAgent(targetAgent)?.kind !== "codex") {
-          return sendJson(response, 409, { error: "workflow tasks require a codex agent" });
-        }
-        const job = store.createJob({
-          id: body.id,
-          kind: body.kind,
-          requiredCapability,
-          maxAttempts: body.max_attempts,
-          requestedBy: body.requested_by,
-          targetAgent,
-          sourceHost: body.source_host,
-          targetHost: body.target_host,
-          payload
-        });
-        publish(targetAgent, "job.created", job);
+        const job = dispatchJob({ store, publish }, body);
         return sendJson(response, 201, { job });
       }
       const jobRoute = url.pathname.match(/^\/v1\/jobs\/([^/]+)$/);
@@ -176,7 +147,10 @@ export function createServer({ dbPath = "./data/agent-relay.db", token = process
         if (existing.target_agent && existing.target_agent !== actor) {
           return sendJson(response, 403, { error: "agent is not the job target" });
         }
-        const job = store.claimJob(id, actor);
+        if (body.claim_token_version !== undefined && body.claim_token_version !== 1) {
+          return sendJson(response, 400, { error: "unsupported claim_token_version" });
+        }
+        const job = store.claimJob(id, actor, { withToken: body.claim_token_version === 1 });
         return job ? sendJson(response, 200, { job }) : sendJson(response, 409, { error: "job is not available" });
       }
       const jobResult = url.pathname.match(/^\/v1\/jobs\/([^/]+)\/(complete|fail|cancel)$/);
@@ -186,23 +160,30 @@ export function createServer({ dbPath = "./data/agent-relay.db", token = process
         const id = decodeURIComponent(jobResult[1]);
         const action = jobResult[2];
         const body = await readJsonBody(request);
+        if (action === "fail" && body.retryable !== undefined && typeof body.retryable !== "boolean") {
+          return sendJson(response, 400, { error: "retryable must be a boolean" });
+        }
         const existing = store.getJob(id);
         if (!existing) return sendJson(response, 404, { error: "job not found" });
         if (action === "cancel" && actor !== existing.requested_by && actor !== existing.target_agent) {
           return sendJson(response, 403, { error: "agent is not authorized for this job" });
         }
+        if (action !== "cancel" && actor !== existing.target_agent && actor !== existing.claimed_by) {
+          return sendJson(response, 403, { error: "agent is not authorized for this job" });
+        }
         const job = action === "complete"
-          ? store.completeJobBy(id, body.result, actor)
+          ? store.completeJobBy(id, body.result, actor, body.claim_token)
           : action === "fail"
-            ? store.failJobBy(id, body.error, actor)
+            ? store.failJobBy(id, body.error, actor, body.claim_token, { retryable: body.retryable })
             : store.cancelJob(id);
-        if (!job) return sendJson(response, 403, { error: "agent is not authorized for this job" });
+        if (!job) return sendJson(response, 409, { error: "job claim is no longer current" });
         publishJobEvent(job);
         return sendJson(response, 200, { job });
       }
       return sendJson(response, 404, { error: "not found" });
     } catch (error) {
-      const status = Number.isInteger(error.status) && error.status >= 400 && error.status < 500 ? error.status : 500;
+      const status = error instanceof URIError ? 400
+        : Number.isInteger(error.status) && error.status >= 400 && error.status < 500 ? error.status : 500;
       if (status === 500) console.error(error);
       return sendJson(response, status, { error: status === 500 ? "internal server error" : error.message });
     }
@@ -226,10 +207,7 @@ export function createServer({ dbPath = "./data/agent-relay.db", token = process
 
   function publishJobEvent(job) {
     const event = job.status === "queued" ? "job.created" : `job.${job.status}`;
-    publish(job.status === "queued" ? job.target_agent : job.requested_by, event, job);
-    if (job.status === "queued" && job.requested_by && job.requested_by !== job.target_agent) {
-      publish(job.requested_by, event, job);
-    }
+    for (const agentId of new Set([job.target_agent, job.requested_by].filter(Boolean))) publish(agentId, event, job);
   }
 
   function openEvents(agentId, request, response) {
@@ -240,10 +218,7 @@ export function createServer({ dbPath = "./data/agent-relay.db", token = process
       "x-accel-buffering": "no",
       connection: "keep-alive",
     });
-    if (response.write(`event: ready\ndata: ${JSON.stringify({ agent_id: agentId })}\n\n`) === false) {
-      response.destroy?.();
-      return;
-    }
+    if (!writeEvent(response, `event: ready\ndata: ${JSON.stringify({ agent_id: agentId })}\n\n`)) return;
     if (!subscribers.has(agentId)) subscribers.set(agentId, new Set());
     subscribers.get(agentId).add(response);
     let keepAlive;
@@ -254,15 +229,24 @@ export function createServer({ dbPath = "./data/agent-relay.db", token = process
     };
     keepAlive = setInterval(() => {
       try {
-        if (response.write(": keep-alive\n\n") === false) {
+        if (!writeEvent(response, ": keep-alive\n\n")) {
           cleanup();
-          response.destroy?.();
         }
       } catch { cleanup(); }
     }, 15000);
     request.on("close", cleanup);
     response.on("close", cleanup);
   }
+}
+
+function writeEvent(response, chunk) {
+  if (response.destroyed || response.writableEnded) return false;
+  if ((response.writableLength ?? 0) + Buffer.byteLength(chunk) > MAX_EVENT_QUEUE_BYTES) {
+    response.destroy?.();
+    return false;
+  }
+  response.write(chunk);
+  return true;
 }
 
 function authenticate(request, token) {

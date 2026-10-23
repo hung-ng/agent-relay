@@ -30,3 +30,23 @@ test("requestJson preserves caller cancellation alongside its timeout", async ()
   controller.abort();
   await assert.rejects(pending, /caller aborted/);
 });
+
+test("requestJson times out while reading a response body", async () => {
+  await assert.rejects(requestJson("http://relay", {
+    timeoutMs: 10,
+    fetchImpl: async (url, { signal }) => ({
+      ok: true, status: 200,
+      json: () => new Promise((resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }))
+    })
+  }), (error) => error.code === "ETIMEDOUT");
+});
+
+test("requestJson rejects malformed success responses and preserves HTTP errors", async () => {
+  const json = async () => { throw new SyntaxError("not JSON"); };
+  await assert.rejects(requestJson("http://relay", {
+    fetchImpl: async () => ({ ok: true, status: 200, json })
+  }), (error) => error.code === "EINVALIDJSON");
+  await assert.rejects(requestJson("http://relay", {
+    fetchImpl: async () => ({ ok: false, status: 502, json })
+  }), (error) => error.status === 502);
+});

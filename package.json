@@ -8,13 +8,14 @@
   },
   "scripts": {
     "start": "node src/cli.js server",
+    "check": "node scripts/check.mjs",
     "test": "node --test",
     "smoke": "node scripts/smoke.mjs",
     "backup": "node scripts/backup-db.mjs",
     "monitor": "node scripts/monitor-relay.mjs"
   },
   "engines": {
-    "node": ">=22.5"
+    "node": ">=22.13.0"
   },
   "license": "MIT"
 }

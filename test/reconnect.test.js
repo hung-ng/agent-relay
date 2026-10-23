@@ -70,14 +70,15 @@ test("worker replays unfinished work after reconnecting", async (t) => {
 
   await worker.register();
   await worker.replayPending();
+  await worker.drainPromise;
 
   assert.deepEqual(replayedMessages, [message.message.id]);
   assert.deepEqual(replayedJobs, [job.job.id]);
 
   const workerHeaders = { "x-agent-id": "probe@mini" };
   await jsonRequest(app, "POST", `/v1/messages/${encodeURIComponent(message.message.id)}/ack`, undefined, workerHeaders);
-  await jsonRequest(app, "POST", `/v1/jobs/${encodeURIComponent(job.job.id)}/claim`, { agent_id: "probe@mini" }, workerHeaders);
-  await jsonRequest(app, "POST", `/v1/jobs/${encodeURIComponent(job.job.id)}/complete`, { result: { ok: true }, }, workerHeaders);
+  const claimed = await jsonRequest(app, "POST", `/v1/jobs/${encodeURIComponent(job.job.id)}/claim`, { agent_id: "probe@mini" }, workerHeaders);
+  await jsonRequest(app, "POST", `/v1/jobs/${encodeURIComponent(job.job.id)}/complete`, { result: { ok: true }, claim_token: claimed.job.claim_token }, workerHeaders);
   assert.deepEqual(
     await jsonRequest(app, "GET", "/v1/pending?agent_id=probe%40mini", undefined, { "x-agent-id": "probe@mini" }),
     { messages: [], jobs: [] }

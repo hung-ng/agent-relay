@@ -57,8 +57,9 @@ async function runWorker(options) {
     process.exit(2);
   }
   const kind = options.kind ?? process.env.AGENT_KIND ?? "probe";
-  const capabilities = options.capabilities
-    ? options.capabilities.split(",").map((value) => value.trim()).filter(Boolean)
+  const configuredCapabilities = options.capabilities ?? process.env.AGENT_CAPABILITIES;
+  const capabilities = configuredCapabilities
+    ? configuredCapabilities.split(",").map((value) => value.trim()).filter(Boolean)
     : (kind === "probe" ? ["network.probe"] : ["agent.task"]);
   const worker = new Worker({
     serverUrl: server,
@@ -78,6 +79,11 @@ async function runWorker(options) {
 }
 
 async function runTask(action, options) {
+  if (!["run", "status", "wait", "cancel"].includes(action)) {
+    console.error(`unknown task action: ${action}`);
+    process.exitCode = 2;
+    return;
+  }
   const server = options.server ?? process.env.AGENT_RELAY_URL;
   const requestedBy = options.requested_by ?? process.env.AGENT_ID ?? "cli@local";
   const headers = {
@@ -133,6 +139,7 @@ async function runTask(action, options) {
   }
 
   const body = {
+    ...(options.id === undefined ? {} : { id: options.id }),
     kind: "agent.task",
     capability: payload.execution_mode === "write" ? "agent.task.write" : "agent.task",
     requested_by: requestedBy,
@@ -187,7 +194,9 @@ export function parseArgs(args) {
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (!arg.startsWith("--")) continue;
-    const [key, inline] = arg.slice(2).split("=", 2);
+    const separator = arg.indexOf("=");
+    const key = arg.slice(2, separator === -1 ? undefined : separator);
+    const inline = separator === -1 ? undefined : arg.slice(separator + 1);
     if (inline !== undefined) {
       result[key.replaceAll("-", "_")] = inline;
     } else if (args[index + 1] && !args[index + 1].startsWith("--")) {

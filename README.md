@@ -2,7 +2,7 @@
 
 `agent-relay` is a small coordinator for local Claude Code, Codex, and host-side jobs. It gives every worker an identity, durable messages, targeted jobs, and live wakeups without requiring a peer-to-peer network.
 
-It currently uses only Node.js built-ins. Node 22.5 or newer is required because the coordinator stores state in SQLite through `node:sqlite`.
+It currently uses only Node.js built-ins. Node 22.13.0 or newer is required because the coordinator stores state through `node:sqlite`, which became available without `--experimental-sqlite` in that release.
 
 ## Run the coordinator
 
@@ -87,13 +87,21 @@ When a `message`, `request`, or `task` is sent to a Claude or Codex worker, the 
 
 Workers replay unfinished messages and jobs whenever they connect or reconnect. A message stays replayable until it is acknowledged. A job stays replayable while it is queued or running for that worker, so a disconnect does not lose work that is already in the SQLite store.
 
+Each worker executes one item at a time while continuing to read events. Every 15 seconds it checks active claims and fetches another batch of up to 200 pending messages and 200 jobs. This recovers missed wakeups and drains backlogs larger than one batch. Workers register again after reconnecting or when a heartbeat reports that their registration is missing.
+
 Workers send their identity in the `X-Agent-Id` header. The server checks that header when a worker reads pending work, delivers or acknowledges a message, claims a job, sends a job result, or heartbeats. When `AGENT_RELAY_TOKEN` is set, workers also send the matching bearer token.
+
+Current workers claim jobs with `claim_token_version: 1` and include the returned `claim_token` when completing or failing the job. An expired attempt cannot change a newer attempt. Legacy claims remain supported for staged upgrades, but workers need the current claim protocol for this protection.
 
 Jobs require a capability. The HTTP API uses `kind` as the capability by default, or accepts an explicit `capability` field. Host-based dispatch selects only online agents that advertise that capability.
 
 Jobs retry up to three times by default. Set `max_attempts` from 1 to 10 when creating a job. A job returns to `queued` after a failed attempt or when its worker goes offline, and becomes `failed` after the final attempt, which gives callers a dead-letter state to inspect.
 
+Workers can report a permanent failure with `retryable: false` on the failure endpoint. The job then becomes `failed` immediately. Current workers use this when the relay rejects a result that cannot be delivered, so completed work does not run repeatedly because its report is too large.
+
 Execution can repeat after a disconnect or retry. Tasks with side effects must tolerate repeated execution. Reusing a creation ID prevents duplicate records, but does not guarantee a task runs only once.
+
+While a worker stays running, it retains undelivered job results and message replies so it can resend them after a network error without repeating the same execution. These cached results do not survive a worker restart.
 
 ## Run a Codex workflow
 
@@ -111,12 +119,14 @@ node src/cli.js task \
 
 The initial workflows are:
 
-- `prompt` runs the supplied prompt as written.
+- `prompt` runs the supplied prompt as written in a read-only sandbox with no approval prompt.
 - `review` asks Codex to inspect the repository and return findings without editing files. It runs with a read-only sandbox and no approval prompt.
 - `test` asks Codex to run focused checks and report the evidence without editing files. It runs with a read-only sandbox and no approval prompt.
 - `implement` asks Codex to make the requested change and run relevant validation. It requires a worker advertising `agent.task.write`; that capability enables a workspace-write sandbox with no approval prompt, so only grant it to an isolated worker you intend to authorize for unattended edits.
 
 Use `--source-host` instead of `--target-agent` when the relay should select an online worker for a host. Use `--wait-ms 0` to submit without polling, or `--cwd` to select the repository directory on the worker. The workflow name remains in the job payload so later policy and audit rules can distinguish read-only reviews from implementation work.
+
+Pass `--id YOUR_STABLE_ID` when submitting a task that you may need to retry after a timeout. The same ID returns the original job, including when its worker has since gone offline. Workflow execution modes must match their workflow, and implementation work always requires `agent.task.write`.
 
 The CLI also supports durable follow-up actions:
 
@@ -126,7 +136,9 @@ node src/cli.js task wait --server https://mini.example.ts.net --job-id JOB_ID -
 node src/cli.js task cancel --server https://mini.example.ts.net --job-id JOB_ID --requested-by operator@mini
 ```
 
-Cancellation changes the durable job state. It does not terminate a subprocess already running on the worker. Inspect that process on the worker before retrying a cancelled operational task.
+Cancellation changes the durable job state and sends an event to the target worker. Current workers abort the running task when they receive that event or observe the cancelled state during a heartbeat. On macOS and Linux, cancellation, task timeout, and worker shutdown terminate the subprocess group, escalating to `SIGKILL` after five seconds if it has not exited. Probe cancellation closes its active connection and skips remaining checks.
+
+A cancellation response confirms the stored state. An unreachable or older worker may still be executing, so confirm that it has stopped before repeating work with side effects.
 
 ## Example network test
 
@@ -168,13 +180,22 @@ The first worker supports `network.probe` and `agent.task`. Add another job type
 
 Agent tasks stop after ten minutes by default so a stalled subprocess cannot hold a durable job forever. Set `AGENT_RELAY_TASK_TIMEOUT_MS` or pass `--task-timeout-ms` to the worker to change the limit, up to 24 hours.
 
+On macOS and Linux, an unsuccessful CLI exit also terminates remaining subprocesses before the job can retry.
+
+Workers send prompts through stdin, so large prompts and text beginning with a CLI flag stay task input. Codex tasks use a read-only sandbox and `approval_policy="never"` unless they explicitly request authorized write execution. Claude print workers use `dontAsk` permission mode, which denies operations that require an interactive permission prompt.
+
+Captured stdout and stderr each have a limit of 128,000 characters and 256,000 JSON-encoded bytes. Results include `stdout_truncated` and `stderr_truncated` flags. This keeps job results and message replies within the relay's request limit. Large probe reports retain bounded check details and report any omitted details while still executing every requested check.
+
 ## Development
 
 ```bash
+npm run check
 npm test
 ```
 
-The test suite uses an in-memory SQLite database and does not open a network port.
+The test suite uses in-memory and temporary SQLite databases. Integration tests open ephemeral ports on `127.0.0.1`, run fake agent tasks, and verify worker recovery, retries, cancellation, CLI idempotency, and the smoke script. It does not call Claude or Codex or connect to deployed workers.
+
+GitHub Actions runs these checks on pushes and pull requests across Node 22, 24, and 26 on Ubuntu and macOS.
 
 ## Run with launchd
 
@@ -214,6 +235,8 @@ Before using a remote worker, choose the server bind address, private URL, port,
 
 The server can also run a daily SQLite backup and a minute-by-minute monitor. Render `backup.plist.template` and `monitor.plist.template` with the same `AGENT_RELAY_ROOT`, `AGENT_RELAY_DATA`, and `AGENT_RELAY_LOG_DIR` values. Set `AGENT_RELAY_BACKUP_RETENTION` to the number of daily copies to keep. The monitor checks `/healthz`, `/readyz`, and the expected online worker capability, then records its last result in `data/monitor-state.json`.
 
+The monitor checks all three endpoints concurrently with a ten-second request timeout and requires successful health and readiness payloads. It replaces its state file atomically. A SQLite lock prevents overlapping backups and releases automatically if the backup process exits or crashes.
+
 Load these jobs after rendering them:
 
 ```bash
@@ -227,4 +250,4 @@ launchctl bootstrap "$launch_domain" "$HOME/Library/LaunchAgents/$backup_label.p
 launchctl bootstrap "$launch_domain" "$HOME/Library/LaunchAgents/$monitor_label.plist"
 ```
 
-Backups are verified SQLite files under `data/backups`. Keep a copy on another disk or machine. Restoring one requires stopping the server, moving the current database aside, copying the selected backup to `data/agent-relay.db`, and starting the server again.
+Database and backup files use mode `0600`; new data and backup directories use `0700`. Backups require an existing source database and verify SQLite integrity before keeping a copy under `data/backups`. Keep a copy on another disk or machine. Restoring one requires stopping the server, moving the current database aside, copying the selected backup to `data/agent-relay.db`, and starting the server again.

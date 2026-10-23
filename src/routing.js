@@ -1,5 +1,5 @@
 export function normalizeJobPayload({ kind, payload, sourceHost = null, targetHost = null }) {
-  const normalizedPayload = isRecord(payload) ? payload : {};
+  const normalizedPayload = isRecord(payload) ? { ...payload } : {};
   if (kind !== "network.probe") return normalizedPayload;
   return {
     ...normalizedPayload,
