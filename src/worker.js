@@ -95,6 +95,7 @@ export class Worker {
         else throw error;
       }
     }
+    for (const id of this.messageReplies.keys()) this.enqueueWork("message", { id });
     await this.replayPending();
   }
 

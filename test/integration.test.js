@@ -97,6 +97,45 @@ test("heartbeat restores registration and drains work beyond a pending batch", {
   assert.deepEqual(errors, []);
 });
 
+test("heartbeat recovers cached replies after ambiguous acknowledgements", { timeout: 10_000 }, async (t) => {
+  for (const committed of [false, true]) {
+    await t.test(committed ? "response lost after commit" : "request lost before commit", async (t) => {
+      const { app, worker, request } = await startRelay(t);
+      let executions = 0;
+      worker.runAgentTask = async () => ({ stdout: `answer ${++executions}` });
+      await worker.register();
+      const { message } = await request("/v1/messages", {
+        method: "POST",
+        body: { sender: "operator", recipient: "worker", type: "request", payload: { body: "work" } }
+      });
+      const realRequest = worker.request.bind(worker);
+      let loseAcknowledgement = true;
+      worker.request = async (route, options) => {
+        if (route.endsWith("/ack") && loseAcknowledgement) {
+          loseAcknowledgement = false;
+          if (committed) await realRequest(route, options);
+          throw new Error("acknowledgement response lost");
+        }
+        return realRequest(route, options);
+      };
+      await assert.rejects(worker.handleMessage(message), /acknowledgement response lost/);
+      assert.equal(worker.messageReplies.size, 1);
+      assert.equal(app.store.getMessage(message.id).status, committed ? "acknowledged" : "delivered");
+      if (committed) assert.deepEqual(app.store.getPendingWork("worker").messages, []);
+
+      await worker.heartbeat();
+      await worker.drainPromise;
+
+      assert.equal(worker.messageReplies.size, 0);
+      assert.equal(executions, 1);
+      assert.equal(app.store.getMessage(message.id).status, "acknowledged");
+      assert.deepEqual(app.store.getMessages("operator").map((reply) => reply.payload), [{
+        body: "answer 1", result: { stdout: "answer 1" }
+      }]);
+    });
+  }
+});
+
 test("the CLI reuses --id after its worker goes offline and preserves the prompt", { timeout: 10_000 }, async (t) => {
   const { app, serverUrl } = await startRelay(t, { worker: false });
   app.store.registerAgent({ id: "worker", hostId: "host", kind: "codex", capabilities: ["agent.task"] });

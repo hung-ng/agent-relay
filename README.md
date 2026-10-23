@@ -103,6 +103,8 @@ Execution can repeat after a disconnect or retry. Tasks with side effects must t
 
 While a worker stays running, it retains undelivered job results and message replies so it can resend them after a network error without repeating the same execution. These cached results do not survive a worker restart.
 
+Heartbeats also revisit cached message replies when an acknowledgement response was lost. If the server already acknowledged the message, the worker releases the cached reply without running the task again.
+
 ## Run a Codex workflow
 
 The CLI provides a repeatable task envelope for an `agent.task` worker. It submits the task, waits for a terminal job state, and prints the resulting job as JSON:
