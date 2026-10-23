@@ -1,6 +1,7 @@
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { Store } from "./store.js";
 import { createMcpHandler } from "./mcp.js";
 import { dispatchJob } from "./jobs.js";
@@ -8,7 +9,12 @@ import { readJsonBody } from "./body.js";
 
 const MAX_EVENT_QUEUE_BYTES = 2_097_152;
 
-export function createServer({ dbPath = "./data/agent-relay.db", token = process.env.AGENT_RELAY_TOKEN ?? "" } = {}) {
+export function createServer({
+  dbPath = "./data/agent-relay.db",
+  token = process.env.AGENT_RELAY_TOKEN ?? "",
+  previousToken = process.env.AGENT_RELAY_PREVIOUS_TOKEN ?? ""
+} = {}) {
+  const authenticate = createAuthenticator(token, previousToken);
   fs.mkdirSync(path.dirname(path.resolve(dbPath)), { recursive: true, mode: 0o700 });
   const store = new Store(dbPath);
   const subscribers = new Map();
@@ -38,7 +44,7 @@ export function createServer({ dbPath = "./data/agent-relay.db", token = process
   const server = http.createServer(async (request, response) => {
     try {
       if (request.method === "OPTIONS") return sendJson(response, 204, null);
-      if (!authenticate(request, token)) return sendJson(response, 401, { error: "unauthorized" });
+      if (!authenticate(request)) return sendJson(response, 401, { error: "unauthorized" });
       const url = new URL(request.url, "http://localhost");
 
       if (url.pathname === "/healthz" && request.method === "GET") {
@@ -249,9 +255,23 @@ function writeEvent(response, chunk) {
   return true;
 }
 
-function authenticate(request, token) {
-  if (!token) return true;
-  return request.headers.authorization === `Bearer ${token}`;
+function createAuthenticator(token, previousToken) {
+  if (typeof token !== "string" || typeof previousToken !== "string") {
+    throw new Error("relay authentication tokens must be strings");
+  }
+  if (previousToken && !token) throw new Error("AGENT_RELAY_PREVIOUS_TOKEN requires AGENT_RELAY_TOKEN");
+  if (!token) return () => true;
+  const digest = (value) => createHash("sha256").update(value).digest();
+  const primary = digest(`Bearer ${token}`);
+  const previous = previousToken ? digest(`Bearer ${previousToken}`) : null;
+  return (request) => {
+    const header = request.headers.authorization;
+    if (typeof header !== "string") return false;
+    const supplied = digest(header);
+    const primaryMatches = timingSafeEqual(supplied, primary);
+    const previousMatches = previous ? timingSafeEqual(supplied, previous) : false;
+    return primaryMatches || previousMatches;
+  };
 }
 
 function agentIdentity(request) {

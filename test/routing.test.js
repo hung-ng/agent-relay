@@ -36,6 +36,27 @@ async function jsonRequest(app, method, url, body, headers) {
   return { response, value };
 }
 
+test("coordinator accepts both rotation credentials and rejects the previous one after revocation", async (t) => {
+  const overlapping = createServer({ dbPath: ":memory:", token: "new-token", previousToken: "old-token" });
+  const revoked = createServer({ dbPath: ":memory:", token: "new-token", previousToken: "" });
+  t.after(() => { overlapping.close(); revoked.close(); });
+  for (const credential of ["new-token", "old-token", "wrong-token", "", null]) {
+    const headers = credential === null ? {} : { authorization: `Bearer ${credential}` };
+    const overlap = await jsonRequest(overlapping, "GET", "/healthz", undefined, headers);
+    assert.equal(overlap.response.status, ["new-token", "old-token"].includes(credential) ? 200 : 401);
+    const single = await jsonRequest(revoked, "GET", "/healthz", undefined, headers);
+    assert.equal(single.response.status, credential === "new-token" ? 200 : 401);
+  }
+  const malformed = await jsonRequest(overlapping, "GET", "/healthz", undefined, { authorization: ["Bearer new-token"] });
+  assert.equal(malformed.response.status, 401);
+});
+
+test("previous credentials cannot silently disable coordinator authentication", () => {
+  assert.throws(() => createServer({ dbPath: ":memory:", token: "", previousToken: "old-token" }), /requires AGENT_RELAY_TOKEN/);
+  assert.throws(() => createServer({ dbPath: ":memory:", token: null, previousToken: "" }), /must be strings/);
+  assert.throws(() => createServer({ dbPath: ":memory:", token: "new-token", previousToken: true }), /must be strings/);
+});
+
 test("dispatch selects an agent with the requested capability", async (t) => {
   const app = createServer({ dbPath: ":memory:", token: "" });
   t.after(() => app.close());

@@ -23,6 +23,7 @@ async function main() {
     AGENT_RELAY_DATA: data,
     AGENT_RELAY_LOG_DIR: logDir,
     AGENT_RELAY_TOKEN: process.env.AGENT_RELAY_TOKEN ?? "",
+    AGENT_RELAY_PREVIOUS_TOKEN: process.env.AGENT_RELAY_PREVIOUS_TOKEN ?? "",
     AGENT_RELAY_TASK_TIMEOUT_MS: process.env.AGENT_RELAY_TASK_TIMEOUT_MS ?? "600000",
     AGENT_RELAY_HOST: process.env.AGENT_RELAY_HOST ?? "127.0.0.1",
     AGENT_RELAY_PORT: process.env.AGENT_RELAY_PORT ?? "8787",
@@ -42,12 +43,15 @@ async function main() {
   const placeholders = /@@([A-Z0-9_]+)@@/g;
   const names = new Set([...template.matchAll(placeholders)].map((match) => match[1]));
   for (const name of names) {
-    if (!Object.hasOwn(values, name) || values[name] === undefined || (values[name] === "" && name !== "AGENT_RELAY_TOKEN")) {
+    if (!Object.hasOwn(values, name) || values[name] === undefined || (values[name] === "" && !["AGENT_RELAY_TOKEN", "AGENT_RELAY_PREVIOUS_TOKEN"].includes(name))) {
       throw new Error(`missing value for ${name}`);
     }
     if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\ud800-\udfff\ufffe\uffff]/u.test(values[name])) {
       throw new Error(`invalid XML character in ${name}`);
     }
+  }
+  if (names.has("AGENT_RELAY_PREVIOUS_TOKEN") && values.AGENT_RELAY_PREVIOUS_TOKEN && !values.AGENT_RELAY_TOKEN) {
+    throw new Error("AGENT_RELAY_PREVIOUS_TOKEN requires AGENT_RELAY_TOKEN");
   }
   for (const name of ["NODE_BIN", "AGENT_RELAY_ROOT", "AGENT_RELAY_DATA", "AGENT_RELAY_LOG_DIR", "AGENT_RELAY_TOKEN_FILE"]) {
     if (names.has(name) && !path.isAbsolute(values[name])) throw new Error(`${name} must be an absolute path`);

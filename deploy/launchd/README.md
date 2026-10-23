@@ -27,6 +27,20 @@ Values are escaped for XML and inserted once. Text such as `@@AGENT_ID@@` inside
 
 Keep the environment files and rendered plists outside version control. The rendered files contain the bearer token.
 
+The server template also accepts `AGENT_RELAY_PREVIOUS_TOKEN` during credential rotation. Leave it empty during ordinary operation. To rotate, run the coordinator with the new primary token and the old previous token, verify that both work, then update every worker, monitor, token file, and configured MCP or CLI client. Drain pending work before reloading workers. Changing a plist's token requires unloading and bootstrapping its launchd service; sending `SIGTERM` alone restarts it with launchd's existing environment. After all clients work with the new token, remove the previous token, reload the coordinator, and verify that the old credential receives HTTP 401. Overlap does not expire automatically.
+
+For existing macOS worker plists, use the local credential updater after receiving the new token through a trusted private channel:
+
+```bash
+chmod 600 "$HOME/.private/agent-relay-new-token"
+node scripts/update-worker-token.mjs \
+  --new-token-file "$HOME/.private/agent-relay-new-token" \
+  --plist "$HOME/Library/LaunchAgents/com.agent-relay.worker.codex@macbook.plist" \
+  --plist "$HOME/Library/LaunchAgents/com.agent-relay.worker.probe@macbook.plist"
+```
+
+The default is a dry-run. Verify that the coordinator accepts the candidate credential before adding `--apply`. Include `--token-copy PATH` for each existing private token-file copy that also needs the new value. All selected workers and copies must start with matching credentials. The updater preserves every other plist value, validates all replacements before writing, and saves private recovery backups beside the first worker plist. It replaces credential files with mode `0600` and restores originals if replacement fails. Reload the affected launchd services afterward and verify fresh heartbeats. Remove credential backups and delivery copies after revoking the old token. The updater handles worker plists and explicit token copies; coordinator, monitor, and MCP client updates remain part of the coordinated procedure.
+
 The backup template runs daily at 03:15 and keeps seven copies by default. Set `AGENT_RELAY_BACKUP_RETENTION` before rendering to change that. The monitor template runs every 60 seconds and checks the relay plus the expected worker. Set `AGENT_RELAY_MONITOR_URL`, `AGENT_RELAY_TOKEN`, `AGENT_RELAY_TOKEN_FILE`, `AGENT_RELAY_MONITOR_AGENT_ID`, and `AGENT_RELAY_MONITOR_CAPABILITY` for the target machine. The monitor uses `AGENT_RELAY_TOKEN` directly and falls back to `AGENT_RELAY_TOKEN_FILE` when the direct value is absent.
 
 Jobs retry three times by default. A failed job or a job abandoned by an offline worker is re-queued until `max_attempts` is reached, then remains in `failed` as a dead-letter record with its last error.

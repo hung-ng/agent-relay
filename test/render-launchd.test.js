@@ -91,6 +91,19 @@ test("CLI prepares the monitor's data log directory when launchd logs use anothe
   lintPlist(t, context.output);
 });
 
+test("CLI renders optional previous credentials only for the coordinator", async (t) => {
+  const context = await fixture(t);
+  succeeded(render(context, "server", { AGENT_RELAY_TOKEN: "new-token", AGENT_RELAY_PREVIOUS_TOKEN: "old-token<&" }));
+  const content = await readFile(context.output, "utf8");
+  assert.ok(content.includes("<string>old-token&lt;&amp;</string>"));
+  const rejected = render(context, "server", { AGENT_RELAY_PREVIOUS_TOKEN: "old-token" });
+  assert.notEqual(rejected.status, 0);
+  assert.match(rejected.stderr, /requires AGENT_RELAY_TOKEN/);
+  assert.equal(await readFile(context.output, "utf8"), content);
+  succeeded(render(context, "worker", { AGENT_RELAY_PREVIOUS_TOKEN: "unused-token" }));
+  assert.doesNotMatch(await readFile(context.output, "utf8"), /AGENT_RELAY_PREVIOUS_TOKEN|unused-token/);
+});
+
 test("CLI replaces template placeholders once and preserves XML and replacement characters in values", async (t) => {
   const context = await fixture(t, "project @@AGENT_RELAY_DATA@@ & <source>");
   const token = `literal @@AGENT_RELAY_LOG_DIR@@ @@AGENT_RELAY_TOKEN@@ @@UNKNOWN@@ $& $' $\x60 <>&\"'\r\n😀`;
@@ -107,6 +120,7 @@ test("CLI atomically replaces an existing plist with mode 0600", async (t) => {
   const context = await fixture(t);
   await mkdir(path.dirname(context.output));
   await writeFile(context.output, previousPlist, { mode: 0o644 });
+  await chmod(context.output, 0o644);
   const oldFile = path.join(context.temporary, "previous.plist");
   await link(context.output, oldFile);
   succeeded(render(context, "server", { AGENT_RELAY_TOKEN: "new-token" }));
@@ -168,6 +182,7 @@ test("CLI validates inputs before mutations and preserves the installed plist on
       const context = await fixture(t);
       await mkdir(path.dirname(context.output));
       await writeFile(context.output, previousPlist, { mode: 0o644 });
+      await chmod(context.output, 0o644);
       const result = render(context, template, overrides);
       assert.equal(result.status, 1);
       assert.match(result.stderr, expected);
@@ -218,6 +233,7 @@ test("CLI preserves an installed plist when the temporary write fails", { skip: 
   const directory = path.dirname(context.output);
   await mkdir(directory, { mode: 0o700 });
   await writeFile(context.output, previousPlist, { mode: 0o644 });
+  await chmod(context.output, 0o644);
   let result;
   try {
     await chmod(directory, 0o500);

@@ -5,8 +5,8 @@ import { createServer } from "../src/server.js";
 import { Worker, runProcess } from "../src/worker.js";
 import { requestJson } from "../src/http.js";
 
-async function startRelay(t, { worker: startWorker = true } = {}) {
-  const app = createServer({ dbPath: ":memory:", token: "integration-token" });
+async function startRelay(t, { worker: startWorker = true, token = "integration-token", previousToken = "", workerToken = token } = {}) {
+  const app = createServer({ dbPath: ":memory:", token, previousToken });
   const errors = [];
   let worker;
   t.after(async () => {
@@ -21,12 +21,12 @@ async function startRelay(t, { worker: startWorker = true } = {}) {
   const serverUrl = `http://127.0.0.1:${app.server.address().port}`;
   const request = (route, options = {}) => requestJson(`${serverUrl}${route}`, {
     ...options,
-    headers: { authorization: "Bearer integration-token", ...options.headers }
+    headers: { authorization: `Bearer ${token}`, ...options.headers }
   });
   if (startWorker) {
     worker = new Worker({
       serverUrl, agentId: "worker", hostId: "host", kind: "codex", capabilities: ["agent.task"],
-      token: "integration-token", logger: { log() {}, error: (error) => errors.push(error) }
+      token: workerToken, logger: { log() {}, error: (error) => errors.push(error) }
     });
   }
   const dispatch = (prompt, extra = {}) => request("/v1/jobs", {
@@ -43,6 +43,21 @@ async function waitUntil(predicate, timeoutMs = 5000) {
     await delay(10);
   }
 }
+
+test("old workers keep executing while the operator uses the new rotation credential", { timeout: 10_000 }, async (t) => {
+  const { app, worker, dispatch, errors } = await startRelay(t, {
+    token: "new-token", previousToken: "old-token", workerToken: "old-token"
+  });
+  let executions = 0;
+  worker.runAgentTask = async () => ({ stdout: `completed ${++executions}` });
+  await worker.start();
+  const { job } = await dispatch("work during rotation");
+  await waitUntil(() => app.store.getJob(job.id).status === "completed");
+  assert.equal(app.store.getJob(job.id).result.stdout, "completed 1");
+  assert.equal(app.store.getJob(job.id).attempts, 1);
+  assert.equal(executions, 1);
+  assert.deepEqual(errors, []);
+});
 
 test("HTTP workers retry, cancel a running task, and continue queued work serially", { timeout: 10_000 }, async (t) => {
   const { app, worker, dispatch, request, errors } = await startRelay(t);

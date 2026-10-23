@@ -14,6 +14,8 @@ npm start -- --host 127.0.0.1 --port 8787
 
 Set `AGENT_RELAY_TOKEN` before allowing network access. Keep remote workers behind Tailscale or another private HTTPS network. The relay assumes trusted workers under one operator.
 
+For a coordinated credential change, the coordinator can temporarily accept the old credential through `AGENT_RELAY_PREVIOUS_TOKEN` while `AGENT_RELAY_TOKEN` holds the new one. A previous token requires a nonempty primary token. After every worker and client has switched, remove the previous token and restart the coordinator to revoke it. Both credentials grant the same access during the overlap.
+
 ## Run workers
 
 Workers register an agent, keep a heartbeat, listen for jobs, and execute supported work locally.
