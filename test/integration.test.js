@@ -45,6 +45,32 @@ async function waitUntil(predicate, timeoutMs = 5000) {
   }
 }
 
+test("MCP declines unsupported stream and session methods without reporting a missing endpoint", { timeout: 10_000 }, async (t) => {
+  const { app, serverUrl, request } = await startRelay(t, { worker: false });
+  const initialized = await request("/mcp", { method: "POST", body: {
+    jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18" }
+  } });
+  assert.equal(initialized.result.protocolVersion, "2025-06-18");
+  for (const method of ["GET", "DELETE", "PUT"]) {
+    const response = await fetch(`${serverUrl}/mcp`, {
+      method, headers: { authorization: "Bearer integration-token", "mcp-protocol-version": "2025-06-18" }
+    });
+    assert.equal(response.status, 405, method);
+    assert.equal(response.headers.get("allow"), "POST");
+    await response.arrayBuffer();
+  }
+  const ping = await request("/mcp", { method: "POST", headers: { "mcp-protocol-version": "2025-06-18" }, body: {
+    jsonrpc: "2.0", id: 2, method: "ping"
+  } });
+  assert.deepEqual(ping.result, {});
+  await assert.rejects(request("/mcp", { method: "POST", headers: { "mcp-protocol-version": "2099-01-01" }, body: {
+    jsonrpc: "2.0", id: 3, method: "tools/call", params: {
+      name: "send_message", arguments: { sender: "operator", recipient: "worker", body: "must not be sent" }
+    }
+  } }), (error) => error.status === 400);
+  assert.equal(app.store.db.prepare("SELECT count(*) AS count FROM messages").get().count, 0);
+});
+
 test("HTTP and MCP reject invalid UTF-8 before persisting messages", { timeout: 10_000 }, async (t) => {
   const { app, serverUrl, request } = await startRelay(t, { worker: false });
   const envelopes = [

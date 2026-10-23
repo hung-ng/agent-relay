@@ -1,5 +1,6 @@
 import { normalizeJobPayload, requiredCapabilityForJob } from "./routing.js";
 import { executionModeForWorkflow } from "./workflows.js";
+import { normalizeRecordId, validateAgentId, validateIdentifier } from "./identifiers.js";
 
 export function dispatchJob({ store, publish }, input) {
   for (const field of ["kind", "requested_by"]) requireString(input[field], field);
@@ -13,8 +14,14 @@ export function dispatchJob({ store, publish }, input) {
     throw requestError("payload must be a JSON object");
   }
 
-  const existing = input.id ? store.getJob(input.id.trim()) : null;
+  const id = input.id === undefined || input.id === null ? input.id : normalizeRecordId(input.id, "job id");
+  const existing = id ? store.getJob(id) : null;
   if (existing) return existing;
+
+  validateAgentId(input.requested_by, "requested_by");
+  if (input.target_agent !== undefined && input.target_agent !== null) validateAgentId(input.target_agent, "target_agent");
+  if (input.source_host !== undefined && input.source_host !== null) validateIdentifier(input.source_host, "source_host");
+  if (input.target_host !== undefined && input.target_host !== null) validateIdentifier(input.target_host, "target_host");
 
   const payload = normalizeJobPayload({
     kind: input.kind,
@@ -51,7 +58,7 @@ export function dispatchJob({ store, publish }, input) {
     throw requestError("workflow tasks require a codex agent", 409);
   }
   const job = store.createJob({
-    id: input.id,
+    id,
     kind: input.kind,
     requiredCapability,
     maxAttempts: input.max_attempts,

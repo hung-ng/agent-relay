@@ -39,10 +39,8 @@ export class Worker {
   async start() {
     await this.register();
     this.heartbeatTimer = setInterval(() => {
-      if (this.heartbeatPromise) return;
-      this.heartbeatPromise = this.heartbeat()
-        .catch((error) => { if (!this.stopped) this.logger.error(error); })
-        .finally(() => { this.heartbeatPromise = null; });
+      this.sendHeartbeat().catch((error) => { if (!this.stopped) this.logger.error(error); });
+      this.reconcileWork().catch((error) => { if (!this.stopped) this.logger.error(error); });
     }, 15000);
     this.connectionPromise = this.connectEvents();
   }
@@ -52,7 +50,7 @@ export class Worker {
     clearInterval(this.heartbeatTimer);
     this.abortController.abort();
     this.pendingWork.clear();
-    await Promise.allSettled([this.connectionPromise, this.heartbeatPromise, this.drainPromise]);
+    await Promise.allSettled([this.connectionPromise, this.heartbeatPromise, this.reconciliationPromise, this.replayPromise, this.drainPromise]);
   }
 
   async register() {
@@ -68,12 +66,34 @@ export class Worker {
   }
 
   async heartbeat() {
-    try {
-      await this.request(`/v1/agents/${encodeURIComponent(this.agentId)}/heartbeat`, { method: "POST" });
-    } catch (error) {
-      if (error.status !== 404) throw error;
-      await this.register();
+    await this.sendHeartbeat();
+    await this.reconcileWork();
+  }
+
+  sendHeartbeat() {
+    if (this.stopped) return Promise.resolve();
+    if (!this.heartbeatPromise) {
+      this.heartbeatPromise = (async () => {
+        try {
+          await this.request(`/v1/agents/${encodeURIComponent(this.agentId)}/heartbeat`, { method: "POST" });
+        } catch (error) {
+          if (error.status !== 404) throw error;
+          await this.register();
+        }
+      })().finally(() => { this.heartbeatPromise = null; });
     }
+    return this.heartbeatPromise;
+  }
+
+  reconcileWork() {
+    if (this.stopped) return Promise.resolve();
+    if (!this.reconciliationPromise) {
+      this.reconciliationPromise = this.reconcile().finally(() => { this.reconciliationPromise = null; });
+    }
+    return this.reconciliationPromise;
+  }
+
+  async reconcile() {
     for (const [id, active] of this.jobControllers) {
       if (active.attempts === Infinity) continue;
       try {
@@ -116,7 +136,9 @@ export class Worker {
         connectTimer = null;
         if (!response.ok || !response.body) throw new Error(`event stream failed: ${response.status}`);
         this.reconnectDelayMs = 1000;
-        await this.replayPending();
+        this.replayPending().catch((error) => {
+          if (!this.stopped) this.logger.error(`agent-relay pending replay failed: ${error.message}`);
+        });
         await this.consumeEvents(response.body);
         if (!this.stopped) throw new Error("event stream closed");
       } catch (error) {
@@ -170,7 +192,15 @@ export class Worker {
     }
   }
 
-  async replayPending() {
+  replayPending() {
+    if (this.stopped) return Promise.resolve();
+    if (!this.replayPromise) {
+      this.replayPromise = this.readPending().finally(() => { this.replayPromise = null; });
+    }
+    return this.replayPromise;
+  }
+
+  async readPending() {
     const pending = await this.request(`/v1/pending?agent_id=${encodeURIComponent(this.agentId)}&limit=200`);
     for (const message of pending.messages ?? []) this.enqueueWork("message", message);
     for (const job of pending.jobs ?? []) this.enqueueWork("job", job);

@@ -16,6 +16,8 @@ Set `AGENT_RELAY_TOKEN` before allowing network access. Keep remote workers behi
 
 JSON request bodies are limited to 1 MiB and require valid UTF-8. The HTTP and MCP endpoints reject malformed encoding with HTTP 400 before storing messages or jobs.
 
+Message and job IDs are trimmed at creation and limited to 4096 characters after `encodeURIComponent`. Reply message IDs allow 4104 characters to fit the generated `reply:` prefix. IDs cannot be `.` or `..`, contain NUL, or contain unpaired Unicode surrogates. Agent identities and sender, recipient, and requester references must also roundtrip the `X-Agent-Id` header without changes, so they require Latin-1 characters, no ASCII control characters, and no leading or trailing spaces. Hosts and conversation IDs cannot contain NUL or unpaired surrogates. Message bodies and job payload text retain their Unicode support.
+
 For a coordinated credential change, the coordinator can temporarily accept the old credential through `AGENT_RELAY_PREVIOUS_TOKEN` while `AGENT_RELAY_TOKEN` holds the new one. A previous token requires a nonempty primary token. After every worker and client has switched, remove the previous token and restart the coordinator to revoke it. Both credentials grant the same access during the overlap.
 
 ## Run workers
@@ -60,6 +62,8 @@ Run each worker under `launchd` so it reconnects after a reboot. The worker make
 
 The coordinator exposes a small MCP endpoint at `/mcp`.
 
+It negotiates protocol `2025-06-18` during initialization. Unsupported `MCP-Protocol-Version` headers receive HTTP 400 before tool execution. Requests without that header remain accepted for existing clients. The endpoint accepts POST messages; GET streams and DELETE session requests receive HTTP 405 with `Allow: POST`, following the [MCP lifecycle](https://modelcontextprotocol.io/specification/2025-06-18/basic/lifecycle) and [transport rules](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports).
+
 ```bash
 claude mcp add --transport http agent-relay \
   https://mini.example.ts.net/mcp
@@ -91,7 +95,7 @@ When a `message`, `request`, or `task` is sent to a Claude or Codex worker, the 
 
 Workers replay unfinished messages and jobs whenever they connect or reconnect. A message stays replayable until it is acknowledged. A job stays replayable while it is queued or running for that worker, so a disconnect does not lose work that is already in the SQLite store.
 
-Each worker executes one item at a time while continuing to read events. Every 15 seconds it checks active claims and fetches another batch of up to 200 pending messages and 200 jobs. This recovers missed wakeups and drains backlogs larger than one batch. Workers register again after reconnecting or when a heartbeat reports that their registration is missing.
+Each worker executes one item at a time while continuing to read events. Every 15 seconds it sends a heartbeat and starts a recovery pass if the previous pass has finished. Recovery checks active claims and fetches up to 200 pending messages and 200 jobs. Slow recovery reads do not delay heartbeat requests. A failed pending read leaves the live event stream open, and later recovery passes retry it. This recovers missed wakeups and drains backlogs larger than one batch. Workers register again after reconnecting or when a heartbeat reports that their registration is missing.
 
 Workers send their identity in the `X-Agent-Id` header. The server checks that header when a worker reads pending work, delivers or acknowledges a message, claims a job, sends a job result, or heartbeats. When `AGENT_RELAY_TOKEN` is set, workers also send the matching bearer token.
 

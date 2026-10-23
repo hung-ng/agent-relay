@@ -6,6 +6,7 @@ const SERVER_INFO = {
   name: "agent-relay",
   version: "0.1.0"
 };
+const PROTOCOL_VERSION = "2025-06-18";
 
 export function mcpTools() {
   return [
@@ -139,6 +140,10 @@ export function mcpTools() {
 
 export function createMcpHandler({ store, publish }) {
   return async function handleMcp(request, response) {
+    const transportVersion = request.headers?.["mcp-protocol-version"];
+    if (transportVersion !== undefined && transportVersion !== PROTOCOL_VERSION) {
+      return sendJson(response, 400, jsonRpcError(null, -32600, "unsupported MCP protocol version", { supported: [PROTOCOL_VERSION] }));
+    }
     let body;
     try {
       body = await readJsonBody(request);
@@ -157,7 +162,7 @@ export function createMcpHandler({ store, publish }) {
       const result = await handleRequest(body, { store, publish });
       const sessionId = request.headers?.["mcp-session-id"] ?? (body.method === "initialize" ? randomUUID() : null);
       if (sessionId) response.setHeader("Mcp-Session-Id", sessionId);
-      response.setHeader("MCP-Protocol-Version", body.params?.protocolVersion ?? "2025-06-18");
+      response.setHeader("MCP-Protocol-Version", PROTOCOL_VERSION);
       return sendJson(response, 200, { jsonrpc: "2.0", id: body.id ?? null, result });
     } catch (error) {
       return sendJson(response, 200, jsonRpcError(body.id ?? null, error.rpcCode ?? -32603, error.message));
@@ -169,7 +174,7 @@ async function handleRequest(body, context) {
   switch (body.method) {
     case "initialize":
       return {
-        protocolVersion: body.params?.protocolVersion ?? "2025-06-18",
+        protocolVersion: PROTOCOL_VERSION,
         capabilities: { tools: {} },
         serverInfo: SERVER_INFO
       };
@@ -313,6 +318,6 @@ function sendJson(response, status, payload) {
   response.end(JSON.stringify(payload));
 }
 
-function jsonRpcError(id, code, message) {
-  return { jsonrpc: "2.0", id, error: { code, message } };
+function jsonRpcError(id, code, message, data) {
+  return { jsonrpc: "2.0", id, error: { code, message, ...(data === undefined ? {} : { data }) } };
 }

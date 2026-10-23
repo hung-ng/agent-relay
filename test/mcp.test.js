@@ -3,11 +3,37 @@ import assert from "node:assert/strict";
 import { Store } from "../src/store.js";
 import { createMcpHandler } from "../src/mcp.js";
 
-function requestFor(body) {
+function requestFor(body, headers = {}) {
   return {
+    headers,
     async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify(body)); }
   };
 }
+
+test("MCP negotiates its supported version and rejects unsupported transport versions", async (t) => {
+  const store = new Store(":memory:");
+  t.after(() => store.close());
+  const handler = createMcpHandler({ store, publish() {} });
+  for (const version of ["2025-06-18", "2099-01-01"]) {
+    const response = responseFor();
+    await handler(requestFor({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: version } }), response);
+    assert.equal(JSON.parse(response.body).result.protocolVersion, "2025-06-18");
+    assert.equal(response.headers["MCP-Protocol-Version"], "2025-06-18");
+  }
+  for (const version of ["2099-01-01", "", ["2025-06-18"]]) {
+    const response = responseFor();
+    await handler(requestFor({ jsonrpc: "2.0", id: 2, method: "tools/call", params: {
+      name: "send_message", arguments: { sender: "operator", recipient: "worker", body: "must not be sent" }
+    } }, { "mcp-protocol-version": version }), response);
+    assert.equal(response.status, 400);
+    assert.deepEqual(JSON.parse(response.body).error.data.supported, ["2025-06-18"]);
+  }
+  assert.equal(store.db.prepare("SELECT count(*) AS count FROM messages").get().count, 0);
+  const ping = responseFor();
+  await handler(requestFor({ jsonrpc: "2.0", id: 3, method: "ping" }, { "mcp-protocol-version": "2025-06-18" }), ping);
+  assert.equal(ping.status, 200);
+  assert.deepEqual(JSON.parse(ping.body).result, {});
+});
 
 function responseFor() {
   return {

@@ -2,6 +2,14 @@ import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { chmodSync } from "node:fs";
 import {
+  MAX_ENCODED_ID_LENGTH,
+  MAX_ENCODED_REPLY_ID_LENGTH,
+  normalizeRecordId,
+  validateAgentId,
+  validateIdentifier,
+  validateRecordId
+} from "./identifiers.js";
+import {
   normalizeCapabilities,
   normalizeMetadata,
   supportsCapability
@@ -96,6 +104,8 @@ export class Store {
   }
 
   registerAgent({ id, hostId, kind = "unknown", capabilities = [], metadata = {} }) {
+    validateAgentId(id);
+    validateIdentifier(hostId, "host_id");
     const timestamp = now();
     const normalizedKind = typeof kind === "string" && kind.trim() ? kind : "unknown";
     const normalizedCapabilities = normalizeCapabilities(capabilities);
@@ -115,6 +125,7 @@ export class Store {
   }
 
   heartbeat(id) {
+    validateAgentId(id);
     const timestamp = now();
     const result = this.db.prepare(
       "UPDATE agents SET status = 'online', last_seen = ? WHERE id = ?"
@@ -123,6 +134,7 @@ export class Store {
   }
 
   getAgent(id) {
+    validateAgentId(id);
     const row = this.db.prepare("SELECT * FROM agents WHERE id = ?").get(id);
     return row ? this.#agent(row) : null;
   }
@@ -133,6 +145,7 @@ export class Store {
   }
 
   findAgentForHost(hostId, capability, { kind = null } = {}) {
+    validateIdentifier(hostId, "host_id");
     this.markStale();
     const rows = this.db.prepare(
       "SELECT * FROM agents WHERE host_id = ? AND status = 'online' AND (? IS NULL OR kind = ?) ORDER BY last_seen DESC"
@@ -145,6 +158,7 @@ export class Store {
   }
 
   agentSupports(agentId, capability) {
+    validateAgentId(agentId);
     this.markStale();
     const agent = this.getAgent(agentId);
     return Boolean(agent && agent.status === "online" && supportsCapability(agent.capabilities, capability));
@@ -158,8 +172,9 @@ export class Store {
   }
 
   requeueStaleJobs() {
+    // SQLite truncates legacy NUL IDs on read. Use row IDs for maintenance.
     const rows = this.db.prepare(`
-      SELECT jobs.id
+      SELECT jobs.rowid AS store_rowid, jobs.*
       FROM jobs
       INNER JOIN agents ON agents.id = jobs.target_agent
       WHERE jobs.status = 'running' AND agents.status = 'offline'
@@ -167,24 +182,33 @@ export class Store {
     `).all();
     const jobs = [];
     for (const row of rows) {
-      const existing = this.getJob(row.id);
-      if (!existing || existing.status !== "running") continue;
+      const existing = this.#job(row);
       const error = "target agent went offline before completing the job";
       const terminal = existing.attempts >= existing.max_attempts;
       const result = this.db.prepare(`
         UPDATE jobs
         SET status = ?, error = ?, completed_at = ?, started_at = NULL, claimed_by = NULL, claim_token = NULL
-        WHERE id = ? AND status = 'running' AND claim_token IS ? AND attempts = ?
+        WHERE rowid = ? AND status = 'running' AND claim_token IS ? AND attempts = ?
           AND EXISTS (SELECT 1 FROM agents WHERE agents.id = jobs.target_agent AND agents.status = 'offline')
-      `).run(terminal ? "failed" : "queued", error, terminal ? now() : null, row.id, existing.claim_token, existing.attempts);
-      if (result.changes > 0) jobs.push(this.getJob(row.id));
+      `).run(terminal ? "failed" : "queued", error, terminal ? now() : null, row.store_rowid, existing.claim_token, existing.attempts);
+      if (result.changes > 0) {
+        const updated = this.db.prepare("SELECT *, CAST(id AS BLOB) AS store_id_bytes FROM jobs WHERE rowid = ?").get(row.store_rowid);
+        // A lossy ID could notify a different job. Recover the row without publishing it.
+        if (updated && Buffer.from(updated.id).equals(updated.store_id_bytes)) jobs.push(this.#job(updated));
+      }
     }
     return jobs;
   }
 
   createMessage({ id, conversationId = null, sender, recipient, type = "message", payload }) {
-    const messageId = normalizeId(id, "message");
+    const messageId = normalizeRecordId(id, "message id", MAX_ENCODED_REPLY_ID_LENGTH);
+    const existing = this.getMessage(messageId);
+    if (existing) return existing;
     const normalizedType = typeof type === "string" && type.trim() ? type : "message";
+    validateRecordId(messageId, "message id", normalizedType === "reply" ? MAX_ENCODED_REPLY_ID_LENGTH : MAX_ENCODED_ID_LENGTH);
+    validateAgentId(sender, "sender");
+    validateAgentId(recipient, "recipient");
+    if (conversationId !== null) validateIdentifier(conversationId, "conversation_id");
     const timestamp = now();
     this.db.prepare(`
       INSERT INTO messages
@@ -196,11 +220,13 @@ export class Store {
   }
 
   getMessage(id) {
+    validateRecordId(id, "message id", MAX_ENCODED_REPLY_ID_LENGTH);
     const row = this.db.prepare("SELECT * FROM messages WHERE id = ?").get(id);
     return row ? this.#message(row) : null;
   }
 
   getMessages(recipient, limit = 50) {
+    validateAgentId(recipient, "recipient");
     const rows = this.db.prepare(`
       SELECT * FROM messages
       WHERE recipient = ?
@@ -211,6 +237,7 @@ export class Store {
   }
 
   getPendingMessages(recipient, limit = 50) {
+    validateAgentId(recipient, "recipient");
     const rows = this.db.prepare(`
       SELECT * FROM messages
       WHERE recipient = ? AND status = 'queued'
@@ -221,6 +248,7 @@ export class Store {
   }
 
   getPendingWork(agentId, limit = 50) {
+    validateAgentId(agentId);
     const boundedLimit = normalizeLimit(limit);
     const messages = this.db.prepare(`
       SELECT * FROM messages
@@ -242,6 +270,7 @@ export class Store {
   }
 
   markMessageDeliveredBy(id, agentId) {
+    validateAgentId(agentId);
     return this.#transitionMessage(id, agentId, "delivered");
   }
 
@@ -250,6 +279,7 @@ export class Store {
   }
 
   acknowledgeMessageBy(id, agentId) {
+    validateAgentId(agentId);
     return this.#transitionMessage(id, agentId, "acknowledged");
   }
 
@@ -269,7 +299,13 @@ export class Store {
   }
 
   createJob({ id, kind, requiredCapability = null, maxAttempts = 3, requestedBy, targetAgent = null, sourceHost = null, targetHost = null, payload = {} }) {
-    const jobId = normalizeId(id, "job");
+    const jobId = normalizeRecordId(id, "job id");
+    const existing = this.getJob(jobId);
+    if (existing) return existing;
+    validateAgentId(requestedBy, "requested_by");
+    if (targetAgent !== null) validateAgentId(targetAgent, "target_agent");
+    if (sourceHost !== null) validateIdentifier(sourceHost, "source_host");
+    if (targetHost !== null) validateIdentifier(targetHost, "target_host");
     const timestamp = now();
     const parsedAttempts = Number(maxAttempts);
     const boundedAttempts = Number.isFinite(parsedAttempts) ? Math.min(Math.max(Math.floor(parsedAttempts) || 3, 1), 10) : 3;
@@ -283,11 +319,14 @@ export class Store {
   }
 
   getJob(id) {
+    validateRecordId(id, "job id");
     const row = this.db.prepare("SELECT * FROM jobs WHERE id = ?").get(id);
     return row ? this.#job(row) : null;
   }
 
   claimJob(id, agentId, { withToken = true } = {}) {
+    validateRecordId(id, "job id");
+    validateAgentId(agentId);
     const timestamp = now();
     const result = this.db.prepare(`
       UPDATE jobs
@@ -304,6 +343,7 @@ export class Store {
   }
 
   completeJobBy(id, result, agentId, claimToken = null) {
+    validateAgentId(agentId);
     return this.#finishJob(id, "completed", { result }, agentId, claimToken);
   }
 
@@ -312,10 +352,12 @@ export class Store {
   }
 
   failJobBy(id, error, agentId, claimToken = null, { retryable = true } = {}) {
+    validateAgentId(agentId);
     return this.#finishJob(id, "failed", { error, retryable }, agentId, claimToken);
   }
 
   #finishJob(id, status, values, agentId = null, claimToken = null) {
+    if (claimToken !== null) validateIdentifier(claimToken, "claim_token");
     const existing = this.getJob(id);
     if (!existing || (agentId && existing.claimed_by !== agentId)) return null;
     if (agentId && existing.claim_token !== claimToken) return null;
@@ -348,6 +390,7 @@ export class Store {
   }
 
   cancelJob(id) {
+    validateRecordId(id, "job id");
     const timestamp = now();
     this.db.prepare(`
       UPDATE jobs SET status = 'cancelled', completed_at = ?
@@ -406,13 +449,6 @@ export class Store {
       claim_token: row.claim_token
     };
   }
-}
-
-function normalizeId(value, type) {
-  if (value === undefined || value === null) return randomUUID();
-  const normalized = String(value).trim();
-  if (!normalized) throw new Error(`${type} id must be a non-empty string`);
-  return normalized;
 }
 
 function normalizeLimit(value) {

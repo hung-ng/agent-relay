@@ -54,7 +54,10 @@ export function createServer({
         store.checkReady();
         return sendJson(response, 200, { ok: true, service: "agent-relay" });
       }
-      if (url.pathname === "/mcp" && request.method === "POST") return await mcpHandler(request, response);
+      if (url.pathname === "/mcp") {
+        if (request.method !== "POST") return sendJson(response, 405, { error: "method not allowed" }, { allow: "POST" });
+        return await mcpHandler(request, response);
+      }
       if (url.pathname === "/v1/events" && request.method === "GET") {
         const agentId = url.searchParams.get("agent_id");
         const actor = agentIdentity(request);
@@ -287,9 +290,9 @@ function isOptionalId(value) {
   return value === undefined || value === null || isNonEmptyString(value);
 }
 
-function sendJson(response, status, payload) {
+function sendJson(response, status, payload, extraHeaders = {}) {
   if (response.writableEnded || response.destroyed) return;
-  const headers = { "content-type": "application/json; charset=utf-8" };
+  const headers = { "content-type": "application/json; charset=utf-8", ...extraHeaders };
   if (status === 204) {
     response.writeHead(status);
     response.end();
