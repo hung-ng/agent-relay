@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { chmod, link, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { writePrivateFile } from "../src/files.js";
 import { convertPlist, main, parseArgs, updateWorkerToken } from "../scripts/update-worker-token.mjs";
@@ -31,7 +31,7 @@ function worker(label, token) {
 }
 
 async function fixture(t, { oldToken = "fake-old", newToken = "fake-new" } = {}) {
-  const root = await mkdtemp(path.join(os.tmpdir(), "agent-relay-worker-token-test-"));
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "agent-relay-worker-token-test-")));
   t.after(() => rm(root, { recursive: true, force: true }));
   await mkdir(path.join(root, "plists"));
   const plists = ["one", "two"].map((name) => path.join(root, "plists", `${name}.plist`));
@@ -162,6 +162,9 @@ test("already-current credentials still receive private permissions without chan
 test("invalid input never creates backups or changes any input bytes or permissions", async (t) => {
   const cases = [
     ["empty candidate", async (c) => writeFile(c.options.newTokenFile, "")],
+    ["whitespace candidate", async (c) => writeFile(c.options.newTokenFile, " \t\n")],
+    ["candidate with leading space", async (c) => writeFile(c.options.newTokenFile, ` ${c.newToken}\n`)],
+    ["candidate with trailing space", async (c) => writeFile(c.options.newTokenFile, `${c.newToken} \n`)],
     ["candidate with multiple lines", async (c) => writeFile(c.options.newTokenFile, "fake-new\nextra\n")],
     ["candidate with CR injection", async (c) => writeFile(c.options.newTokenFile, "fake-new\rInjected: value")],
     ["candidate with NUL", async (c) => writeFile(c.options.newTokenFile, "fake-new\0")],
@@ -301,6 +304,104 @@ test("a failed replacement restores original bytes and modes and retains recover
   const backup = path.join(path.dirname(paths[0]), directories[0]);
   const manifest = JSON.parse(await readFile(path.join(backup, "manifest.json"), "utf8"));
   for (const [index, entry] of manifest.targets.entries()) assert.deepEqual(await readFile(path.join(backup, entry.backupFile)), original[index]);
+});
+
+test("an edit to a later target is preserved instead of overwritten", async (t) => {
+  const context = await fixture(t);
+  const [first, second] = context.options.plists;
+  const original = await readFile(first);
+  const edited = JSON.parse(await readFile(second, "utf8"));
+  edited.WorkingDirectory = "/operator/edited";
+  const editedBytes = Buffer.from(JSON.stringify(edited));
+  let changed = false;
+  await assert.rejects(updateWorkerToken({ ...context.options, apply: true }, {
+    convert: fixtureConvert,
+    writeFile: async (filename, bytes) => {
+      await writePrivateFile(filename, bytes);
+      if (!changed && filename === first) {
+        changed = true;
+        await writeFile(second, editedBytes);
+      }
+    }
+  }), /Replacement failed/);
+  assert.deepEqual(await readFile(first), original);
+  assert.deepEqual(await readFile(second), editedBytes);
+  assert.equal(await readFile(context.options.tokenCopies[0], "utf8"), `${context.oldToken}\r\n`);
+});
+
+test("rollback preserves an operator edit to an already replaced target", async (t) => {
+  const context = await fixture(t);
+  const [first, second] = context.options.plists;
+  const secondOriginal = await readFile(second);
+  const edited = JSON.parse(await readFile(first, "utf8"));
+  edited.WorkingDirectory = "/operator/edited";
+  const editedBytes = Buffer.from(JSON.stringify(edited));
+  let failed = false;
+  await assert.rejects(updateWorkerToken({ ...context.options, apply: true }, {
+    convert: fixtureConvert,
+    writeFile: async (filename, bytes) => {
+      await writePrivateFile(filename, bytes);
+      if (!failed && filename === second) {
+        failed = true;
+        await writeFile(first, editedBytes);
+        throw new Error("injected failure after an operator edit");
+      }
+    }
+  }), /some files could not be restored/);
+  assert.deepEqual(await readFile(first), editedBytes);
+  assert.deepEqual(await readFile(second), secondOriginal);
+});
+
+test("a later edit prevents a false successful update", async (t) => {
+  const context = await fixture(t);
+  const [first, second] = context.options.plists;
+  const secondOriginal = await readFile(second);
+  const edited = JSON.parse(await readFile(first, "utf8"));
+  edited.WorkingDirectory = "/operator/edited";
+  const editedBytes = Buffer.from(JSON.stringify(edited));
+  let changed = false;
+  await assert.rejects(updateWorkerToken({ ...context.options, apply: true }, {
+    convert: fixtureConvert,
+    writeFile: async (filename, bytes) => {
+      await writePrivateFile(filename, bytes);
+      if (!changed && filename === second) {
+        changed = true;
+        await writeFile(first, editedBytes);
+      }
+    }
+  }), /some files could not be restored/);
+  assert.deepEqual(await readFile(first), editedBytes);
+  assert.deepEqual(await readFile(second), secondOriginal);
+});
+
+test("retargeting a directory alias cannot redirect credential writes", async (t) => {
+  const context = await fixture(t);
+  const intended = path.join(context.root, "intended");
+  const unrelated = path.join(context.root, "unrelated");
+  await mkdir(intended);
+  await mkdir(unrelated);
+  const selected = path.join(intended, "worker.plist");
+  const unselected = path.join(unrelated, "worker.plist");
+  const original = await readFile(context.options.plists[1]);
+  await writeFile(selected, original);
+  await writeFile(unselected, original);
+  const alias = path.join(context.root, "alias");
+  await symlink(intended, alias);
+  const first = context.options.plists[0];
+  let moved = false;
+  await updateWorkerToken({ ...context.options, plists: [first, path.join(alias, "worker.plist")], apply: true }, {
+    convert: fixtureConvert,
+    writeFile: async (filename, bytes) => {
+      await writePrivateFile(filename, bytes);
+      if (!moved && filename === first) {
+        moved = true;
+        await rm(alias);
+        await symlink(unrelated, alias);
+      }
+    }
+  });
+  assert.equal(JSON.parse(await readFile(selected, "utf8")).EnvironmentVariables.AGENT_RELAY_TOKEN, context.newToken);
+  assert.deepEqual(await readFile(unselected), original);
 });
 
 test("backup failure leaves targets intact and keeps the partial recovery directory", async (t) => {

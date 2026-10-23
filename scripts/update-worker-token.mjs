@@ -66,12 +66,13 @@ async function readInput(filename, privateFile) {
     const info = await lstat(resolved);
     if (!info.isFile() || info.uid !== process.getuid()) throw fail("Inputs must be owned regular files, without symlinks.");
     if (privateFile && (info.mode & 0o077)) throw fail("Token files must have no group or other permissions.");
-    handle = await open(resolved, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const physical = await realpath(resolved);
+    handle = await open(physical, constants.O_RDONLY | constants.O_NOFOLLOW);
     const opened = await handle.stat();
     if (!opened.isFile() || opened.dev !== info.dev || opened.ino !== info.ino) throw fail("An input changed while being read.");
     return {
-      path: resolved,
-      realPath: await realpath(resolved),
+      path: physical,
+      realPath: physical,
       identity: `${opened.dev}:${opened.ino}`,
       mode: opened.mode & 0o777,
       privateFile,
@@ -91,6 +92,7 @@ function readToken(bytes, candidate = false) {
   catch { throw fail("Token files must contain UTF-8 text."); }
   if (!token || /[\r\n]/.test(token)) throw fail("Token files must contain one nonempty line, with an optional final newline.");
   if (candidate) {
+    if (token.trim() !== token) throw fail("The candidate token must not start or end with whitespace.");
     try { validateHeaderValue("authorization", `Bearer ${token}`); }
     catch { throw fail("The candidate token must be safe for an HTTP header."); }
   }
@@ -217,14 +219,27 @@ async function prepareAndApply({ newTokenFile, plists, tokenCopies = [], apply =
   const attempted = [];
   try {
     for (const target of targets.filter((target) => target.changed)) {
+      await verifyInputs([target]);
       attempted.push(target);
       await writeFile(target.path, target.replacement);
       await chmod(target.path, 0o600);
+    }
+    for (const target of targets) {
+      const current = await readInput(target.path, target.privateFile);
+      if (current.realPath !== target.realPath || !current.bytes.equals(target.changed ? target.replacement : target.bytes) || current.mode !== 0o600) {
+        throw fail("A target changed after replacement.");
+      }
     }
   } catch {
     let restored = true;
     for (const target of attempted.reverse()) {
       try {
+        const current = await readInput(target.path, target.privateFile);
+        if (current.bytes.equals(target.bytes) && current.mode === target.mode) continue;
+        if (current.realPath !== target.realPath || !current.bytes.equals(target.replacement) || current.mode !== 0o600) {
+          restored = false;
+          continue;
+        }
         await writeFile(target.path, target.bytes);
         await chmod(target.path, target.mode);
       } catch { restored = false; }
