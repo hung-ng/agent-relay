@@ -39,7 +39,7 @@ async function jsonRequest(app, method, url, body, headers = {}) {
   return value;
 }
 
-function mockTransport(t, app, responseDelay = () => 0) {
+function mockTransport(t, app, responseDelay = () => 0, dropRequest = () => false) {
   const requests = [];
   t.mock.method(globalThis, "fetch", (url, options = {}) => {
     const { origin, pathname, search } = new URL(url);
@@ -63,6 +63,7 @@ function mockTransport(t, app, responseDelay = () => 0) {
       };
       if (options.signal?.aborted) return onAbort();
       options.signal?.addEventListener("abort", onAbort, { once: true });
+      if (dropRequest(pathname)) return;
       let response;
       if (pathname === "/v1/events") {
         let controller;
@@ -146,6 +147,45 @@ test("scheduled heartbeats keep a running claim alive during slow reconciliation
     [20_000, 80_000, 140_000]);
 });
 
+test("a heartbeat lost before arrival cannot expire a healthy running claim", async (t) => {
+  const start = Date.UTC(2026, 9, 23);
+  t.mock.timers.enable({ apis: ["Date", "setInterval", "setTimeout"], now: start });
+  const app = createServer({ dbPath: ":memory:", token: "" });
+  const worker = new Worker({
+    serverUrl: "http://bus", agentId: "worker", hostId: "host", kind: "codex", capabilities: ["agent.task"],
+    logger: { log() {}, error() {} }
+  });
+  t.after(async () => { await worker.stop(); app.close(); });
+  let dropped = false;
+  const requests = mockTransport(t, app, () => 0, (route) => {
+    if (!route.endsWith("/heartbeat") || dropped) return false;
+    dropped = true;
+    return true;
+  });
+  let executions = 0;
+  worker.runAgentTask = async (_, { signal }) => {
+    executions += 1;
+    await new Promise(resolve => signal.addEventListener("abort", resolve, { once: true }));
+    throw signal.reason;
+  };
+  await advanceTime(t, 5000);
+  await worker.start();
+  await nextTurn();
+  const { job } = await jsonRequest(app, "POST", "/v1/jobs", {
+    id: "slow", kind: "agent.task", requested_by: "operator", target_agent: "worker", payload: { prompt: "wait" }
+  });
+  await nextTurn();
+  const claim = app.store.getJob(job.id).claim_token;
+  await advanceTime(t, 60_000);
+  assert.equal(dropped, true);
+  assert.equal(app.store.getAgent("worker").status, "online");
+  assert.equal(app.store.getJob(job.id).status, "running");
+  assert.equal(app.store.getJob(job.id).claim_token, claim);
+  assert.equal(app.store.getJob(job.id).attempts, 1);
+  assert.equal(executions, 1);
+  assert.equal(requests.filter(({ path }) => path === "/v1/events").length, 1);
+});
+
 test("pending timeouts preserve a healthy event stream and retry missed work", async (t) => {
   const start = Date.UTC(2026, 9, 23);
   t.mock.timers.enable({ apis: ["Date", "setInterval", "setTimeout"], now: start });
@@ -203,7 +243,7 @@ test("pending timeouts preserve a healthy event stream and retry missed work", a
   assert.equal(requests.filter(({ path }) => path === "/v1/events").length, 1);
 });
 
-test("scheduled heartbeat POSTs do not overlap when their responses are slow", async (t) => {
+test("scheduled heartbeat POSTs time out before the next interval when responses are slow", async (t) => {
   const start = Date.UTC(2026, 9, 23);
   t.mock.timers.enable({ apis: ["Date", "setInterval", "setTimeout"], now: start });
   const app = createServer({ dbPath: ":memory:", token: "" });
@@ -218,7 +258,7 @@ test("scheduled heartbeat POSTs do not overlap when their responses are slow", a
   await advanceTime(t, 80_000);
 
   assert.deepEqual(requests.filter(({ path }) => path.endsWith("/heartbeat")).map(({ time }) => time - start),
-    [15_000, 45_000, 75_000]);
+    [15_000, 30_000, 45_000, 60_000, 75_000]);
   assert.equal(app.store.getAgent("worker").status, "online");
   assert.equal(requests.filter(({ path }) => path === "/v1/events").length, 1);
 });

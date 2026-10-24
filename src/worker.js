@@ -10,6 +10,7 @@ const MAX_ENCODED_OUTPUT = 256_000;
 const EVENT_CONNECT_TIMEOUT_MS = 30_000;
 const EVENT_IDLE_TIMEOUT_MS = 45_000;
 const MAX_EVENT_BUFFER = 2_097_152;
+const HEARTBEAT_TIMEOUT_MS = 10_000;
 
 export class Worker {
   constructor({ serverUrl, agentId, hostId, kind = "probe", capabilities = ["network.probe"], token = "", command = null, cwd = process.cwd(), allowWrite = false, taskTimeoutMs = 600_000, logger = console }) {
@@ -53,9 +54,10 @@ export class Worker {
     await Promise.allSettled([this.connectionPromise, this.heartbeatPromise, this.reconciliationPromise, this.replayPromise, this.drainPromise]);
   }
 
-  async register() {
+  async register({ timeoutMs } = {}) {
     await this.request("/v1/agents/register", {
       method: "POST",
+      timeoutMs,
       body: {
         id: this.agentId,
         host_id: this.hostId,
@@ -75,10 +77,10 @@ export class Worker {
     if (!this.heartbeatPromise) {
       this.heartbeatPromise = (async () => {
         try {
-          await this.request(`/v1/agents/${encodeURIComponent(this.agentId)}/heartbeat`, { method: "POST" });
+          await this.request(`/v1/agents/${encodeURIComponent(this.agentId)}/heartbeat`, { method: "POST", timeoutMs: HEARTBEAT_TIMEOUT_MS });
         } catch (error) {
           if (error.status !== 404) throw error;
-          await this.register();
+          await this.register({ timeoutMs: HEARTBEAT_TIMEOUT_MS });
         }
       })().finally(() => { this.heartbeatPromise = null; });
     }
@@ -378,11 +380,12 @@ export class Worker {
     });
   }
 
-  async request(path, { method = "GET", body } = {}) {
+  async request(path, { method = "GET", body, timeoutMs } = {}) {
     return requestJson(`${this.serverUrl}${path}`, {
       method,
       headers: { ...this.headers(), ...(body === undefined ? {} : { "content-type": "application/json" }) },
       body,
+      timeoutMs,
       signal: this.abortController.signal
     });
   }
