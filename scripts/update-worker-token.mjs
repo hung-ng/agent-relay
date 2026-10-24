@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import path from "node:path";
 import { constants } from "node:fs";
-import { chmod, lstat, mkdtemp, open, realpath } from "node:fs/promises";
+import { chmod, link, lstat, mkdtemp, open, realpath, rename } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { validateHeaderValue } from "node:http";
 import { isDeepStrictEqual } from "node:util";
@@ -153,6 +153,40 @@ async function verifyInputs(inputs) {
   }
 }
 
+async function replaceTarget(target, bytes, mode, writeFile, recordRecovery) {
+  let installed;
+  await writeFile(target.path, bytes, {
+    install: async (temporary, filename) => {
+      const directory = await mkdtemp(path.join(path.dirname(filename), ".agent-relay-worker-token-recovery-"));
+      await chmod(directory, 0o700);
+      const previous = path.join(directory, "previous");
+      await recordRecovery(filename, previous);
+      let moved = false;
+      try {
+        await chmod(temporary, mode);
+        const replacement = await readInput(temporary, target.privateFile);
+        // Capture the actual directory entry, including edits made during staging.
+        await rename(filename, previous);
+        moved = true;
+        const displaced = { ...target, path: previous, realPath: previous };
+        await verifyInputs([displaced]);
+        // Another writer may recreate filename after the move. Never replace it.
+        await link(temporary, filename);
+        installed = { ...replacement, path: filename, realPath: filename };
+        target.installed = installed;
+        await verifyInputs([displaced, installed]);
+      } catch (error) {
+        if (moved) {
+          await link(previous, filename).catch(() => {});
+        }
+        throw error;
+      }
+    }
+  });
+  if (!installed) throw fail("The replacement writer did not install the prepared file.");
+  return installed;
+}
+
 export async function updateWorkerToken(options, { convert = convertPlist, writeFile = writePrivateFile } = {}) {
   try { return await prepareAndApply(options, convert, writeFile); }
   catch (error) {
@@ -198,9 +232,10 @@ async function prepareAndApply({ newTokenFile, plists, tokenCopies = [], apply =
   await verifyInputs(inputs);
   const backupPath = await mkdtemp(path.join(path.dirname(workers[0].path), ".agent-relay-worker-token-backup-"));
   result.backupPath = backupPath;
+  const manifest = { version: 1, targets: [] };
+  const manifestPath = path.join(backupPath, "manifest.json");
   try {
     await chmod(backupPath, 0o700);
-    const manifest = { version: 1, targets: [] };
     for (const [index, target] of targets.entries()) {
       const backupFile = `${index + 1}.original`;
       const filename = path.join(backupPath, backupFile);
@@ -208,27 +243,27 @@ async function prepareAndApply({ newTokenFile, plists, tokenCopies = [], apply =
       await chmod(filename, 0o600);
       manifest.targets.push({ path: target.path, type: target.type, ...(target.label ? { label: target.label } : {}), backupFile, mode: target.mode });
     }
-    const filename = path.join(backupPath, "manifest.json");
-    await writeFile(filename, `${JSON.stringify(manifest, null, 2)}\n`);
-    await chmod(filename, 0o600);
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    await chmod(manifestPath, 0o600);
     await verifyInputs(inputs);
   } catch {
     throw fail(`Private backup preparation failed; no targets were changed. Backups: ${quoted(backupPath)}`);
   }
 
+  const recordRecovery = async (filename, previous) => {
+    const entry = manifest.targets.find(target => target.path === filename);
+    (entry.recoveryPaths ??= []).push(previous);
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  };
   const attempted = [];
   try {
     for (const target of targets.filter((target) => target.changed)) {
       await verifyInputs([target]);
       attempted.push(target);
-      await writeFile(target.path, target.replacement);
-      await chmod(target.path, 0o600);
+      await replaceTarget(target, target.replacement, 0o600, writeFile, recordRecovery);
     }
     for (const target of targets) {
-      const current = await readInput(target.path, target.privateFile);
-      if (current.realPath !== target.realPath || !current.bytes.equals(target.changed ? target.replacement : target.bytes) || current.mode !== 0o600) {
-        throw fail("A target changed after replacement.");
-      }
+      await verifyInputs([target.installed ?? target]);
     }
   } catch {
     let restored = true;
@@ -236,12 +271,12 @@ async function prepareAndApply({ newTokenFile, plists, tokenCopies = [], apply =
       try {
         const current = await readInput(target.path, target.privateFile);
         if (current.bytes.equals(target.bytes) && current.mode === target.mode) continue;
-        if (current.realPath !== target.realPath || !current.bytes.equals(target.replacement) || current.mode !== 0o600) {
+        if (!target.installed || current.identity !== target.installed.identity
+          || current.realPath !== target.realPath || !current.bytes.equals(target.replacement) || current.mode !== 0o600) {
           restored = false;
           continue;
         }
-        await writeFile(target.path, target.bytes);
-        await chmod(target.path, target.mode);
+        await replaceTarget({ ...target.installed }, target.bytes, target.mode, writeFile, recordRecovery);
       } catch { restored = false; }
     }
     throw fail(`Replacement failed; ${restored ? "original files restored" : "some files could not be restored"}. Recovery backups: ${quoted(backupPath)}`);

@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import fs from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { chmod, link, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { writePrivateFile } from "../src/files.js";
@@ -113,6 +115,13 @@ test("apply changes only credentials and saves private original bytes for every 
     assert.equal(entry.mode, index < 2 ? 0o644 : 0o600);
     assert.deepEqual(await readFile(path.join(result.backupPath, entry.backupFile)), original[index]);
     assert.equal((await stat(path.join(result.backupPath, entry.backupFile))).mode & 0o777, 0o600);
+    assert.equal(entry.recoveryPaths.length, 1);
+    for (const recovery of entry.recoveryPaths) {
+      assert.equal(path.dirname(path.dirname(recovery)), path.dirname(filename));
+      assert.equal((await stat(path.dirname(recovery))).mode & 0o777, 0o700);
+      assert.equal((await stat(recovery)).mode & 0o777, entry.mode);
+      assert.deepEqual(await readFile(recovery), original[index]);
+    }
     assert.equal((await stat(filename)).mode & 0o777, 0o600);
     if (index < 2) {
       const expected = JSON.parse(original[index]);
@@ -137,6 +146,19 @@ test("repeat apply accepts all credentials already equal to the candidate", asyn
   assert.deepEqual(await Promise.all([...context.options.plists, ...context.options.tokenCopies].map((filename) => readFile(filename))), bytes);
   const manifest = JSON.parse(await readFile(path.join(second.backupPath, "manifest.json"), "utf8"));
   for (const [index, entry] of manifest.targets.entries()) assert.deepEqual(await readFile(path.join(second.backupPath, entry.backupFile)), bytes[index]);
+});
+
+test("retained originals preserve unselected hard-link aliases and their permissions", async (t) => {
+  const context = await fixture(t);
+  const first = context.options.plists[0];
+  const alias = path.join(context.root, "unselected.plist");
+  await link(first, alias);
+  const original = await readFile(alias);
+  const originalMode = (await stat(alias)).mode & 0o777;
+  await updateWorkerToken({ ...context.options, apply: true }, { convert: fixtureConvert });
+  assert.deepEqual(await readFile(alias), original);
+  assert.equal((await stat(alias)).mode & 0o777, originalMode);
+  assert.equal((await stat(first)).mode & 0o777, 0o600);
 });
 
 test("optional copies and a candidate without a final newline are supported", async (t) => {
@@ -278,10 +300,10 @@ test("a failed replacement restores original bytes and modes and retains recover
   const original = await Promise.all(paths.map((filename) => readFile(filename)));
   let failed = false;
   const writes = [];
-  const writeFile = async (filename, bytes) => {
+  const writeFile = async (filename, bytes, options) => {
     writes.push(filename);
     // Fail after rename too, so the currently attempted target needs restoration.
-    await writePrivateFile(filename, bytes);
+    await writePrivateFile(filename, bytes, options);
     if (!failed && filename === context.options.plists[1]) {
       failed = true;
       throw new Error(`injected secret-bearing write error ${context.newToken}`);
@@ -316,8 +338,8 @@ test("an edit to a later target is preserved instead of overwritten", async (t) 
   let changed = false;
   await assert.rejects(updateWorkerToken({ ...context.options, apply: true }, {
     convert: fixtureConvert,
-    writeFile: async (filename, bytes) => {
-      await writePrivateFile(filename, bytes);
+    writeFile: async (filename, bytes, options) => {
+      await writePrivateFile(filename, bytes, options);
       if (!changed && filename === first) {
         changed = true;
         await writeFile(second, editedBytes);
@@ -327,6 +349,137 @@ test("an edit to a later target is preserved instead of overwritten", async (t) 
   assert.deepEqual(await readFile(first), original);
   assert.deepEqual(await readFile(second), editedBytes);
   assert.equal(await readFile(context.options.tokenCopies[0], "utf8"), `${context.oldToken}\r\n`);
+});
+
+test("an edit while a replacement is staged is preserved", async (t) => {
+  const context = await fixture(t);
+  const first = context.options.plists[0];
+  const edited = JSON.parse(await readFile(first, "utf8"));
+  edited.WorkingDirectory = "/operator/edited";
+  const editedBytes = Buffer.from(JSON.stringify(edited));
+  const originalOpen = fs.open;
+  let saved = false;
+  fs.open = async function (filename, ...args) {
+    const handle = await originalOpen.call(this, filename, ...args);
+    if (!saved && path.dirname(String(filename)) === path.dirname(first)
+      && path.basename(String(filename)).startsWith(`.${path.basename(first)}.`) && String(filename).endsWith(".tmp")) {
+      saved = true;
+      await writeFile(first, editedBytes);
+    }
+    return handle;
+  };
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(updateWorkerToken({ ...context.options, apply: true }, { convert: fixtureConvert }), /Replacement failed/);
+    assert.equal(saved, true);
+    assert.deepEqual(await readFile(first), editedBytes);
+    assert.equal(await readFile(context.options.tokenCopies[0], "utf8"), `${context.oldToken}\r\n`);
+  } finally {
+    fs.open = originalOpen;
+    syncBuiltinESMExports();
+  }
+});
+
+test("installation preserves a file recreated by another writer", async (t) => {
+  const context = await fixture(t);
+  const first = context.options.plists[0];
+  const original = await readFile(first);
+  const edited = JSON.parse(original);
+  edited.WorkingDirectory = "/operator/recreated";
+  const editedBytes = Buffer.from(JSON.stringify(edited));
+  const originalLink = fs.link;
+  let saved = false;
+  fs.link = async function (source, destination) {
+    if (!saved && destination === first) {
+      saved = true;
+      await writeFile(first, editedBytes, { flag: "wx", mode: 0o600 });
+    }
+    return originalLink.call(this, source, destination);
+  };
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(updateWorkerToken({ ...context.options, apply: true }, { convert: fixtureConvert }), /some files could not be restored/);
+    assert.equal(saved, true);
+    assert.deepEqual(await readFile(first), editedBytes);
+    const directory = (await readdir(path.dirname(first))).find(name => name.startsWith(".agent-relay-worker-token-backup-"));
+    const manifest = JSON.parse(await readFile(path.join(path.dirname(first), directory, "manifest.json"), "utf8"));
+    const entry = manifest.targets.find(target => target.path === first);
+    assert.deepEqual(await readFile(entry.recoveryPaths[0]), original);
+  } finally {
+    fs.link = originalLink;
+    syncBuiltinESMExports();
+  }
+});
+
+test("edits through an open original file remain in recovery after installation fails", async (t) => {
+  const context = await fixture(t);
+  const first = context.options.plists[0];
+  const edited = JSON.parse(await readFile(first, "utf8"));
+  edited.WorkingDirectory = "/operator/open-file-edit";
+  const editedBytes = Buffer.from(JSON.stringify(edited));
+  const originalHandle = await fs.open(first, "r+");
+  const originalLink = fs.link;
+  let saved = false;
+  fs.link = async function (source, destination) {
+    const result = await originalLink.call(this, source, destination);
+    if (!saved && destination === first) {
+      saved = true;
+      await originalHandle.truncate(0);
+      await originalHandle.writeFile(editedBytes);
+    }
+    return result;
+  };
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(updateWorkerToken({ ...context.options, apply: true }, { convert: fixtureConvert }), /Replacement failed/);
+    assert.equal(saved, true);
+    const directory = (await readdir(path.dirname(first))).find(name => name.startsWith(".agent-relay-worker-token-backup-"));
+    const manifest = JSON.parse(await readFile(path.join(path.dirname(first), directory, "manifest.json"), "utf8"));
+    const entry = manifest.targets.find(target => target.path === first);
+    assert.deepEqual(await readFile(entry.recoveryPaths[0]), editedBytes);
+  } finally {
+    fs.link = originalLink;
+    syncBuiltinESMExports();
+    await originalHandle.close();
+  }
+});
+
+test("rollback preserves an edit made while restoration is staged", async (t) => {
+  const context = await fixture(t);
+  const [first, second] = context.options.plists;
+  const edited = JSON.parse(await readFile(first, "utf8"));
+  edited.WorkingDirectory = "/operator/rollback-edit";
+  const editedBytes = Buffer.from(JSON.stringify(edited));
+  const originalOpen = fs.open;
+  let restoring = false;
+  let saved = false;
+  fs.open = async function (filename, ...args) {
+    const handle = await originalOpen.call(this, filename, ...args);
+    if (restoring && !saved && path.dirname(String(filename)) === path.dirname(first)
+      && path.basename(String(filename)).startsWith(`.${path.basename(first)}.`) && String(filename).endsWith(".tmp")) {
+      saved = true;
+      await writeFile(first, editedBytes);
+    }
+    return handle;
+  };
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(updateWorkerToken({ ...context.options, apply: true }, {
+      convert: fixtureConvert,
+      writeFile: async (filename, bytes, options) => {
+        if (filename === second) {
+          restoring = true;
+          throw new Error("injected second-target failure");
+        }
+        await writePrivateFile(filename, bytes, options);
+      }
+    }), /some files could not be restored/);
+    assert.equal(saved, true);
+    assert.deepEqual(await readFile(first), editedBytes);
+  } finally {
+    fs.open = originalOpen;
+    syncBuiltinESMExports();
+  }
 });
 
 test("rollback preserves an operator edit to an already replaced target", async (t) => {
@@ -339,8 +492,8 @@ test("rollback preserves an operator edit to an already replaced target", async 
   let failed = false;
   await assert.rejects(updateWorkerToken({ ...context.options, apply: true }, {
     convert: fixtureConvert,
-    writeFile: async (filename, bytes) => {
-      await writePrivateFile(filename, bytes);
+    writeFile: async (filename, bytes, options) => {
+      await writePrivateFile(filename, bytes, options);
       if (!failed && filename === second) {
         failed = true;
         await writeFile(first, editedBytes);
@@ -362,8 +515,8 @@ test("a later edit prevents a false successful update", async (t) => {
   let changed = false;
   await assert.rejects(updateWorkerToken({ ...context.options, apply: true }, {
     convert: fixtureConvert,
-    writeFile: async (filename, bytes) => {
-      await writePrivateFile(filename, bytes);
+    writeFile: async (filename, bytes, options) => {
+      await writePrivateFile(filename, bytes, options);
       if (!changed && filename === second) {
         changed = true;
         await writeFile(first, editedBytes);
@@ -391,8 +544,8 @@ test("retargeting a directory alias cannot redirect credential writes", async (t
   let moved = false;
   await updateWorkerToken({ ...context.options, plists: [first, path.join(alias, "worker.plist")], apply: true }, {
     convert: fixtureConvert,
-    writeFile: async (filename, bytes) => {
-      await writePrivateFile(filename, bytes);
+    writeFile: async (filename, bytes, options) => {
+      await writePrivateFile(filename, bytes, options);
       if (!moved && filename === first) {
         moved = true;
         await rm(alias);
