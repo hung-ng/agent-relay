@@ -11,6 +11,7 @@ const EVENT_CONNECT_TIMEOUT_MS = 30_000;
 const EVENT_IDLE_TIMEOUT_MS = 45_000;
 const MAX_EVENT_BUFFER = 2_097_152;
 const HEARTBEAT_TIMEOUT_MS = 10_000;
+const PROCESS_DRAIN_TIMEOUT_MS = 1_000;
 
 export class Worker {
   constructor({ serverUrl, agentId, hostId, kind = "probe", capabilities = ["network.probe"], token = "", command = null, cwd = process.cwd(), allowWrite = false, taskTimeoutMs = 600_000, logger = console }) {
@@ -439,6 +440,7 @@ export function runProcess(command, args, { timeoutMs, signal, input, ...spawnOp
     let stopping = false;
     let inputError;
     let killTimer;
+    let drainTimer;
     const normalizedTimeoutMs = Number(timeoutMs);
     const kill = (signal) => {
       if (!child.pid) return;
@@ -468,6 +470,7 @@ export function runProcess(command, args, { timeoutMs, signal, input, ...spawnOp
     const cleanup = () => {
       if (timeout) clearTimeout(timeout);
       if (killTimer) clearTimeout(killTimer);
+      if (drainTimer) clearTimeout(drainTimer);
       signal?.removeEventListener("abort", stopChild);
     };
     child.stdout.on("data", (chunk) => stdout.append(stdoutDecoder.write(chunk)));
@@ -476,8 +479,17 @@ export function runProcess(command, args, { timeoutMs, signal, input, ...spawnOp
       cleanup();
       reject(error);
     });
-    // Descendants can keep output pipes open after their parent exits.
-    child.once("exit", () => kill("SIGKILL"));
+    child.once("exit", () => {
+      kill("SIGKILL");
+      // Detached descendants can retain pipes after leaving this process group.
+      drainTimer = setTimeout(() => {
+        if (!child.stdout.readableEnded) stdout.truncated = true;
+        if (!child.stderr.readableEnded) stderr.truncated = true;
+        child.stdout.destroy();
+        child.stderr.destroy();
+        child.stdin?.destroy();
+      }, PROCESS_DRAIN_TIMEOUT_MS);
+    });
     child.on("close", (code, signal) => {
       if (stopping) kill("SIGKILL");
       cleanup();

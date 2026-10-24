@@ -359,6 +359,97 @@ test("a process aborted before starting never executes", async (t) => {
   await assert.rejects(readFile(marker), { code: "ENOENT" });
 });
 
+test("shutdown closes pipes held by detached descendants", { skip: process.platform === "win32", timeout: 8000 }, async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "agent-relay-detached-pipes-"));
+  const pidFile = path.join(root, "descendant.pid");
+  const command = path.join(root, "agent.mjs");
+  const worker = new Worker({
+    serverUrl: "http://bus", agentId: "worker", hostId: "host", kind: "codex", command,
+    logger: { log() {}, error() {} }
+  });
+  t.after(async () => {
+    const pid = await readFile(pidFile, "utf8").then(Number).catch(() => null);
+    if (pid) {
+      try { process.kill(pid, "SIGKILL"); } catch { /* The descendant already exited. */ }
+    }
+    await worker.stop();
+    await rm(root, { recursive: true, force: true });
+  });
+  await writeFile(command, `#!/usr/bin/env node
+import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], { detached: true, stdio: ["ignore", "inherit", "inherit"] });
+writeFileSync(${JSON.stringify(pidFile)}, String(descendant.pid));
+descendant.unref();
+setInterval(() => {}, 1000);`, { mode: 0o700 });
+  const job = { id: "job", kind: "agent.task", attempts: 1, claim_token: "claim", payload: { prompt: "work" } };
+  worker.request = async () => ({ job });
+  worker.enqueueWork("job", job);
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (await readFile(pidFile, "utf8").catch(() => null)) break;
+    await delay(10);
+  }
+  assert.ok(Number(await readFile(pidFile, "utf8")));
+  let deadline;
+  try {
+    await Promise.race([
+      worker.stop(),
+      new Promise((_, reject) => {
+        deadline = setTimeout(() => reject(new Error("detached output pipes blocked worker shutdown")), 2500);
+      })
+    ]);
+  } finally { clearTimeout(deadline); }
+  assert.equal(worker.activeJobs.size, 0);
+});
+
+test("detached output pipes cannot block process exit or timeout", { skip: process.platform === "win32", timeout: 10000 }, async (t) => {
+  for (const mode of ["success", "timeout"]) await t.test(mode, async (t) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-relay-detached-exit-"));
+    const pidFile = path.join(root, "descendant.pid");
+    const controller = new AbortController();
+    let settled;
+    let deadline;
+    t.after(async () => {
+      clearTimeout(deadline);
+      controller.abort();
+      const pid = await readFile(pidFile, "utf8").then(Number).catch(() => null);
+      if (pid) {
+        try { process.kill(pid, "SIGKILL"); } catch { /* The descendant already exited. */ }
+      }
+      await settled;
+      await rm(root, { recursive: true, force: true });
+    });
+    const parent = `
+const fs = require("node:fs");
+const descendant = require("node:child_process").spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], {
+  detached: true, stdio: ["ignore", "inherit", "inherit"]
+});
+fs.writeFileSync(process.argv[1], String(descendant.pid));
+descendant.unref();
+if (${JSON.stringify(mode)} === "success") {
+  process.stdout.write("completed");
+  process.exit(0);
+}
+setInterval(() => {}, 1000);`;
+    settled = runProcess(process.execPath, ["-e", parent, pidFile], {
+      signal: controller.signal, timeoutMs: mode === "timeout" ? 1000 : 5000
+    }).then(result => ({ result }), error => ({ error }));
+    const outcome = await Promise.race([
+      settled,
+      new Promise((_, reject) => {
+        deadline = setTimeout(() => reject(new Error("detached output pipes blocked process settlement")), 3000);
+      })
+    ]);
+    if (mode === "timeout") assert.match(outcome.error?.message ?? "", /timed out after 1000ms/);
+    else {
+      assert.equal(outcome.error, undefined);
+      assert.equal(outcome.result.stdout, "completed");
+      assert.equal(outcome.result.stdout_truncated, true);
+      assert.equal(outcome.result.stderr_truncated, true);
+    }
+  });
+});
+
 test("process output preserves UTF-8 characters split across chunks", async () => {
   const result = await runProcess(process.execPath, ["-e", `
 process.stdout.write(Buffer.from([0xe2]));

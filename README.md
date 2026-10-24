@@ -194,11 +194,11 @@ The first worker supports `network.probe` and `agent.task`. Add another job type
 
 Agent tasks stop after ten minutes by default so a stalled subprocess cannot hold a durable job forever. Set `AGENT_RELAY_TASK_TIMEOUT_MS` or pass `--task-timeout-ms` to the worker to change the limit, up to 24 hours.
 
-On macOS and Linux, every CLI exit terminates remaining subprocesses in its process group. A successful task cannot leave those subprocesses running or wait indefinitely for output pipes they inherited.
+On macOS and Linux, every CLI exit terminates remaining subprocesses in its process group. Captured output pipes close after at most one additional second, so descendants that start a separate process group cannot hold task completion or worker shutdown open by retaining those pipes.
 
 Workers send prompts through stdin, so large prompts and text beginning with a CLI flag stay task input. Codex tasks use a read-only sandbox and `approval_policy="never"` unless they explicitly request authorized write execution. Claude print workers use `dontAsk` permission mode, which denies operations that require an interactive permission prompt.
 
-Captured stdout and stderr each have a limit of 128,000 characters and 256,000 JSON-encoded bytes. Results include `stdout_truncated` and `stderr_truncated` flags. This keeps job results and message replies within the relay's request limit. Large probe reports retain bounded check details and report any omitted details while still executing every requested check.
+Captured stdout and stderr each have a limit of 128,000 characters and 256,000 JSON-encoded bytes. Results include `stdout_truncated` and `stderr_truncated` flags, which also mark pipes closed at the drain deadline. This keeps job results and message replies within the relay's request limit. Large probe reports retain bounded check details and report any omitted details while still executing every requested check.
 
 ## Development
 
